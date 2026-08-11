@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.env.local
+
+# Model weights & cache (JANGAN commit ke git — terlalu besar)
+data/models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.onnx
+
+# HuggingFace Hub cache
+.cache/
+**/models--*/
+**/.locks/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS/editor
+.DS_Store
+.vscode/
+*.swp
+
+# Logs
+*.log
+
+# Hasil eksekusi (generated output — jangan di-commit)
+results/
+data/outputs/
+processed_datasets/
+output_results/

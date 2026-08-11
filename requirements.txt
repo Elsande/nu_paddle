@@ -1,0 +1,23 @@
+# requirements.txt
+# =================
+# Dependensi untuk nu-paddle (NuExtract3-GGUF main + PaddleOCR support).
+# Fase-1: batch extraction via run_batch.py.
+
+# --- NuExtract3-GGUF via llama.cpp (model utama) ---
+llama-cpp-python==0.3.34
+
+# --- PaddleOCR support (OCR pendukung / sumber teks) ---
+paddlepaddle>=3.3.1
+paddleocr>=3.4.0,<4.0.0
+
+# --- Preprocessing (salinan dari AI-Document/preprocessing) ---
+pymupdf>=1.28.0
+opencv-python-headless>=4.10.0.84
+pillow>=12.0.0
+numpy>=1.26.0,<3.0.0
+
+# --- Util ---
+tqdm>=4.66.0
+
+# --- UI Gradio (fase-2) ---
+gradio>=6.0.0
