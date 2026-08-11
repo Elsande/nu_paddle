@@ -19,6 +19,7 @@ Model dimuat SEKALI (singleton) lalu dipakai ulang — untuk CLI maupun UI.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
@@ -193,6 +194,7 @@ def _zone_ocr(image_path: str, ocr_model) -> dict:
             get_layout_model().unload()
         except Exception:  # noqa: BLE001
             pass
+        gc.collect()
 
     for zone in layout_zones:
         if zone.label not in config.LAYOUT_ZONE_TARGETS:
@@ -271,6 +273,13 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
     ocr_text = decision.filtered_text if decision.include_text else ""
 
     # 2) NuExtract3-GGUF (main)
+    # OCR/layout sudah tidak dibutuhkan di fase ini: unload + gc dulu supaya
+    # peak RAM saat NuExtract dimuat/dijalankan tetap di bawah batas.
+    try:
+        ocr_model.unload()
+    except Exception:  # noqa: BLE001
+        pass
+    gc.collect()
     ext = extractor.run(image_path, doc_type=doc_type, ocr_text=ocr_text)
 
     fields = ext.fields if isinstance(ext.fields, dict) else {}
