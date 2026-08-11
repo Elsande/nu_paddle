@@ -42,7 +42,8 @@ nu-paddle/
 │   └── pipeline.py             #   preprocess() wajib untuk semua dokumen
 ├── models/                     # pola AI-Document/models/
 │   ├── base.py                 #   ModelResult + BaseExtractionModel
-│   ├── paddleocr_model.py      #   PaddleOCR (role="support")
+│   ├── paddleocr_model.py      #   PaddleOCR (role="support") + run_region/run_header
+│   ├── layout_model.py         #   PP-DocLayoutV3 (deteksi zona layout, offline)
 │   ├── nuextract_gguf_model.py #   NuExtract3-GGUF (role="main")
 │   └── registry.py             #   AVAILABLE_MODELS
 ├── extraction/
@@ -71,8 +72,14 @@ dokumen (PDF/gambar)
    ▼
 2. PaddleOCR (support) — detect-then-recognize + CLAHE + spatial sort
    -> baris teks + confidence + bbox
-   + run_header(): OCR pas kedua area header/logo (crop atas + upscale 2x)
-     khusus membaca nama perusahaan di dalam logo
+   +
+   OCR per-layout (PP-DocLayoutV3, model lokal/offline):
+   - band header/logo: run_header() crop 22% atas + upscale 2x (nama perusahaan
+     di dalam logo — sengaja TIDAK pakai bbox zona karena teks logo melewati
+     batas zona header_image/header, wide-band terbukti lebih akurat)
+   - zona table: PP-DocLayoutV3 -> crop bbox zona + upscale 1.8x (cap 2400px)
+     untuk angka kecil di tabel
+   Model layout dimuat per kebutuhan lalu langsung di-unload (hemat RAM).
    │
    ▼
 3. selector.evaluate() — TANPA aturan pemblokiran:
@@ -81,14 +88,13 @@ dokumen (PDF/gambar)
    │
    ▼
 4. NuExtract3-GGUF (main)
-   gambar (di-fit <=900k px) + teks OCR (gabungan halaman + header) + schema
+   gambar (di-fit <=900k px) + teks OCR gabungan ([ZONA: header], [ZONA: table]) + schema
    -> JSON terstruktur (field)
    │
    ▼
-5. koreksi dari OCR: `correct_codes_from_ocr()` perbaiki field kode/nomor &
-   NPWP (dari baris OCR ber-conf tinggi) -> normalisasi (tanggal -> ISO,
-   uang -> angka) -> validasi (field wajib, angka positif, tanggal valid)
-   -> PASSED/FAILED
+5. koreksi dari OCR: `correct_codes_from_ocr()` (field kode/nomor + NPWP dari
+   baris ber-conf tinggi) -> normalisasi (tanggal ISO, uang angka) -> validasi
+   (field wajib, angka positif, tanggal valid) -> PASSED/FAILED
    │
    ▼
 6. simpan results/<jenis>_<nama>.json + tabel
@@ -109,6 +115,9 @@ dokumen (PDF/gambar)
 | 7 | **Quality gate non-strict** (`STRICT_QUALITY_GATE=False`) | Blur/resolusi tetap dicatat di hasil, tapi dokumen tetap diproses (anti miss). |
 | 8 | **Venv baru khusus** + **model disalin** | Folder standalone (tidak bergantung path lama). |
 | 9 | **`kwitansi_number` tidak wajib** | Dokumen kwitansi ekadata memang tidak mencetak No. Kwitansi → kalau wajib, hasil jujur (`null`) salah ditandai FAILED. |
+| 10 | **Prioritas instruksi: OCR = sumber nilai persis** | Sebelumnya "gambar yang paling menentukan" → NuExtract mengalahkan OCR yang benar (`POBSP`→`POISSP`). Dibalik: teks OCR paling akurat untuk kode/angka/tanggal/nama; gambar hanya untuk layout bila OCR tak jelas. |
+| 11 | **Koreksi field kode/nomor dari OCR** (`correct_codes_from_ocr`) | PaddleOCR lebih akurat untuk kode: field kode/nomor diperbaiki dari baris OCR ber-conf ≥0.95 yang hampir identik; NPWP diambil dari baris `NPWP:`. Nilai model yang sudah benar tidak dirusak (edit-distance kecil + conf tinggi). |
+| 12 | **OCR per-layout (PP-DocLayoutV3)** | Deteksi zona `header_image`/`header`/`table` (offline). Band header/logo memakai wide-band `run_header` (bukan bbox zona — teks logo melewati batas zona), zona `table` dicrop + upscale 1.8x (cap 2400px). Model layout dimuat per dokumen lalu di-unload (hemat RAM). |
 | 10 | **`results/`, model, venv di-gitignore** | Output + biner besar tidak di-commit. |
 
 ---
@@ -205,6 +214,18 @@ Waktu rata-rata ± 87 detik/dokumen (CPU; PaddleOCR ~15-17s + NuExtract ~45-70s)
   - Tombol "Ekstrak Semua Contoh" (proses semua dokumen di `contoh invoice/`).
   - Model singleton: dimuat sekali, dipakai ulang antara klik (tanpa load ulang).
   - UI hanya memakai `models.registry` (pola AI-Document/app.py).
-- **Fase-3 (opsional):** normalisasi NPWP 15 digit, perbaikan logo/name-field
-  (crop + OCR khusus header), penanganan invoice_date/due_date yang ambigu,
-  indikator progress di UI untuk batch panjang.
+- **Fase-3 (selesai):**
+  - `po_number`/`po_date` (No. & Tanggal PO/SPK) di schema invoice & DO.
+  - OCR per-layout **PP-DocLayoutV3**: zona `table` dicrop + upscale; band
+    header/logo `run_header` (nama di dalam logo terbaca, mis. `PT.INTI
+    SOLUSINDO ABADI`). Model layout di-unload tiap dokumen (hemat RAM).
+  - Prioritas instruksi OCR sebagai sumber nilai persis + `correct_codes_from_ocr`
+    (kode/nomor + NPWP dari baris `NPWP:`).
+  - `due_date` duplikat (`==po_date`) dibuang; `kwitansi_number` kosong bila
+    tidak ada; `invoice_date` = tanggal terbit (bukan Due Date).
+  - Temuan: zona `header_image` berisi logo grafis tanpa teks; nama perusahaan
+    melewati batas zona `header_image`/`header` → pakai wide-band crop.
+- **Fase-4 (opsional):** normalisasi NPWP 15 digit, penanganan spasi pada nama
+  dari logo (`PT.INTI` → `PT. INTI`), indikator progress di UI untuk batch
+  panjang, pengurangan RAM agar batch 8 dokumen bisa satu proses
+  (saat ini jalankan per-grup bila RAM tersedia < 6GB).

@@ -21,7 +21,12 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from config import OCR_CONFIDENCE_THRESHOLD, PADDLEOCR_PARAMS
+from config import (
+    LAYOUT_ZONE_MARGIN,
+    LAYOUT_ZONE_MAX_DIM,
+    OCR_CONFIDENCE_THRESHOLD,
+    PADDLEOCR_PARAMS,
+)
 from models.base import BaseExtractionModel, ModelResult
 
 _LOCAL_MODELS_ROOT = Path(os.path.expanduser("~/.paddlex/official_models"))
@@ -218,12 +223,19 @@ class PaddleOCRModel(BaseExtractionModel):
         except Exception as exc:  # noqa: BLE001
             return ModelResult("", self.name, time.time() - t0, error=str(exc))
 
-    def run_header(self, image_path: str, top_ratio: float = 0.22, scale: float = 2.0) -> ModelResult:
-        """OCR pas kedua khusus area HEADER (logo/kop): crop atas + upscale 2x.
+    def run_region(self, image_path: str, box, scale: float = 1.0, label: str = "", margin: int | None = None) -> ModelResult:
+        """OCR pada satu wilayah (zona layout): crop bbox (+margin) lalu upscale.
 
-        Nama perusahaan sering berada di dalam logo beresolusi rendah yang tidak
-        terbaca pada OCR normal; upscale membuat teks logo bisa terbaca (mis.
-        ``PT.INTI SOLUSINDO ABADI``). Hasilnya digabung sebagai konteks tambahan.
+        Parameters
+        ----------
+        box : iterable [x0, y0, x1, y1]
+            Bounding box zona (koordinat gambar asli).
+        scale : float
+            Faktor perbesaran crop sebelum OCR (logo kecil butuh scale > 1).
+        label : str
+            Nama zona (untuk disimpan di hasil).
+        margin : int
+            Padding sekitar bbox; default dari config.LAYOUT_ZONE_MARGIN.
         """
         t0 = time.time()
         self.load()
@@ -232,8 +244,22 @@ class PaddleOCRModel(BaseExtractionModel):
             if raw_img is None:
                 return ModelResult("", self.name, 0.0, error=f"Gambar tidak terbaca: {image_path}")
             h, w = raw_img.shape[:2]
-            crop = raw_img[0 : int(h * top_ratio), :]
-            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            x0, y0, x1, y1 = [int(v) for v in box]
+            pad = LAYOUT_ZONE_MARGIN if margin is None else margin
+            x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+            x1, y1 = min(w, x1 + pad), min(h, y1 + pad)
+            if x1 <= x0 or y1 <= y0:
+                return ModelResult("", self.name, time.time() - t0, extra={"label": label, "box": list(box), "scale": scale})
+
+            crop = raw_img[y0:y1, x0:x1]
+            if scale > 0 and scale != 1.0:
+                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            # Cap ukuran hasil upscale -> batasi runtime OCR zona.
+            max_dim = max(crop.shape[:2])
+            if max_dim > LAYOUT_ZONE_MAX_DIM:
+                f = LAYOUT_ZONE_MAX_DIM / max_dim
+                crop = cv2.resize(crop, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
+
             lines, kept = self._predict_image(crop)
             filtered_text = "\n".join(ln["text"] for ln in kept)
             return ModelResult(
@@ -241,6 +267,9 @@ class PaddleOCRModel(BaseExtractionModel):
                 self.name,
                 time.time() - t0,
                 extra={
+                    "label": label,
+                    "box": list(box),
+                    "scale": scale,
                     "lines": lines,
                     "kept_lines": kept,
                     "total_lines": len(lines),
@@ -250,6 +279,23 @@ class PaddleOCRModel(BaseExtractionModel):
             )
         except Exception as exc:  # noqa: BLE001
             return ModelResult("", self.name, time.time() - t0, error=str(exc))
+
+    def run_header(self, image_path: str, top_ratio: float = 0.22, scale: float = 2.0) -> ModelResult:
+        """OCR pas kedua khusus area HEADER (logo/kop) — fallback tanpa layout.
+
+        Crop 22% atas halaman + upscale 2x agar teks di dalam logo terbaca.
+        Didelegasikan ke :meth:`run_region` dengan bbox atas (satu jalur kode).
+        """
+        raw_img = cv2.imread(image_path)
+        if raw_img is None:
+            return ModelResult("", self.name, 0.0, error=f"Gambar tidak terbaca: {image_path}")
+        h, w = raw_img.shape[:2]
+        return self.run_region(
+            image_path,
+            [0, 0, w, int(h * top_ratio)],
+            scale=scale,
+            label="header_fallback",
+        )
 
     def unload(self) -> None:
         self._engine = None

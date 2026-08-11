@@ -41,6 +41,35 @@ PADDLEOCR_PARAMS = {
 OCR_CONFIDENCE_THRESHOLD = 0.6
 
 # ---------------------------------------------------------------------------
+# LAYOUT ANALYSIS — PP-DocLayoutV3 (deteksi zona, offline)
+# ---------------------------------------------------------------------------
+LAYOUT_MODEL_NAME = "PP-DocLayoutV3"
+
+# Zona yang ditambah OCR per-layout (DI ATAS OCR halaman penuh).
+# Catatan: header/logo TIDAK memakai bbox zona — teks nama di logo melewati
+# batas zona header_image/header, lebih akurat pakai wide-band (run_header).
+LAYOUT_ZONE_TARGETS = frozenset({"table"})
+
+# Faktor upscale saat OCR per zona (teks logo kecil butuh perbesaran lebih besar).
+LAYOUT_ZONE_SCALE = {
+    "header_image": 3.0,
+    "table": 1.8,
+    "header": 1.0,
+    "text": 1.0,
+    "footer": 1.0,
+}
+
+# Padding (px) di sekitar bbox zona saat crop, agar teks tepi tidak terpotong.
+LAYOUT_ZONE_MARGIN = 20
+
+# Ukuran maksimal sisi terpanjang hasil upscale zona (batasi runtime OCR zona).
+LAYOUT_ZONE_MAX_DIM = 2400
+
+# Fallback bila deteksi layout gagal/kosong (perilaku lama run_header).
+LAYOUT_HEADER_FALLBACK_TOP_RATIO = 0.22
+LAYOUT_HEADER_FALLBACK_SCALE = 2.0
+
+# ---------------------------------------------------------------------------
 # PREPROCESSING (salinan dari AI-Document/preprocessing)
 # ---------------------------------------------------------------------------
 # True  -> dokumen yang gagal quality gate DITOLAK (tidak diproses).

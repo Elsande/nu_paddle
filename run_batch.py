@@ -49,6 +49,7 @@ SUPPORTED_EXTS = config.SUPPORTED_IMAGE_EXTS | {".pdf"}
 # ---------------------------------------------------------------------------
 _OCR: object | None = None
 _EXTRACTOR: object | None = None
+_LAYOUT: object | None = None
 
 
 def get_ocr_model():
@@ -65,6 +66,17 @@ def get_extractor():
         _EXTRACTOR = AVAILABLE_MODELS["NuExtract3-GGUF"]()
         _EXTRACTOR.load()
     return _EXTRACTOR
+
+
+def get_layout_model():
+    """LayoutModel (PP-DocLayoutV3) singleton — dimuat sekali per proses."""
+    global _LAYOUT
+    if _LAYOUT is None:
+        from models.layout_model import LayoutModel
+
+        _LAYOUT = LayoutModel()
+        _LAYOUT.load()
+    return _LAYOUT
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +142,87 @@ def discover_documents(paths: list[str] | None = None) -> list[Path]:
 # ---------------------------------------------------------------------------
 # PROSES SATU DOKUMEN
 # ---------------------------------------------------------------------------
+def _zone_ocr(image_path: str, ocr_model) -> dict:
+    """OCR konteks tambahan: band header/logo (run_header) + zona tabel (layout).
+
+    - Header/logo SELALU pakai wide-band crop (``run_header``): nama perusahaan
+      di dalam logo terbukti lebih akurat dibaca lewat band lebar daripada bbox
+      zona — teks logo sering melewati batas zona ``header_image``/``header``.
+    - Zona ``table`` (PP-DocLayoutV3) dicrop + upscale (kapasitas dibatasi)
+      agar angka kecil di tabel terbaca lebih baik.
+
+    Returns
+    -------
+    dict
+        ``zones`` (meta per zona, termasuk band header), ``all_lines``,
+        ``kept_lines``.
+    """
+    zones_meta: list[dict] = []
+    all_lines: list[dict] = []
+    kept_lines: list[dict] = []
+
+    # 1) Band header/logo — selalu dijalankan.
+    header_res = ocr_model.run_header(image_path)
+    hextra = header_res.extra or {}
+    hctx = "\n".join(ln["text"] for ln in hextra.get("kept_lines") or [])
+    zones_meta.append(
+        {
+            "label": "header",
+            "box": None,
+            "scale": config.LAYOUT_HEADER_FALLBACK_SCALE,
+            "context_text": f"[ZONA: header]\n{hctx}" if hctx else "",
+            "text": hextra.get("all_text", ""),
+            "lines": hextra.get("all_lines", []),
+            "elapsed_seconds": round(header_res.elapsed_seconds, 2),
+            "error": header_res.error,
+        }
+    )
+    all_lines.extend(hextra.get("all_lines") or [])
+    kept_lines.extend(hextra.get("kept_lines") or [])
+
+    # 2) Zona tabel dari deteksi layout (jika tersedia).
+    # Model layout dimuat per kebutuhan lalu DI-UNLOAD segera: menghemat RAM
+    # (~0.5GB) agar tidak menggeser peak melewati batas saat NuExtract berjalan.
+    try:
+        layout = get_layout_model()
+        layout_zones = layout.detect_zones(image_path)
+    except Exception:  # noqa: BLE001
+        layout_zones = []
+    finally:
+        try:
+            get_layout_model().unload()
+        except Exception:  # noqa: BLE001
+            pass
+
+    for zone in layout_zones:
+        if zone.label not in config.LAYOUT_ZONE_TARGETS:
+            continue
+        scale = config.LAYOUT_ZONE_SCALE.get(zone.label, 1.0)
+        zres = ocr_model.run_region(image_path, zone.box, scale=scale, label=zone.label)
+        extra = zres.extra or {}
+        context = "\n".join(ln["text"] for ln in extra.get("kept_lines") or [])
+        zones_meta.append(
+            {
+                "label": zone.label,
+                "box": zone.box,
+                "scale": scale,
+                "context_text": f"[ZONA: {zone.label}]\n{context}" if context else "",
+                "text": extra.get("all_text", ""),
+                "lines": extra.get("all_lines", []),
+                "elapsed_seconds": round(zres.elapsed_seconds, 2),
+                "error": zres.error,
+            }
+        )
+        all_lines.extend(extra.get("all_lines") or [])
+        kept_lines.extend(extra.get("kept_lines") or [])
+
+    return {
+        "zones": zones_meta,
+        "all_lines": all_lines,
+        "kept_lines": kept_lines,
+    }
+
+
 def process_one(doc: Path, ocr_model, extractor) -> dict:
     t_start = time.time()
     doc_type = config.detect_document_type(doc)
@@ -151,22 +244,24 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
             "ocr": {"included": False, "reason": "no image", "stats": {}},
         }
 
-    # 1) PaddleOCR (support)
+    # 1) PaddleOCR (support) — halaman penuh.
     ocr_res = ocr_model.run(image_path)
     ocr_extra = ocr_res.extra or {}
-    # 1b) OCR pas kedua: area header/logo (nama perusahaan sering ada di logo).
-    header_res = ocr_model.run_header(image_path)
-    header_extra = header_res.extra or {}
 
-    # Gabung teks OCR (halaman) + teks OCR (header) sebagai konteks.
-    combined_lines = list(ocr_extra.get("lines") or []) + list(header_extra.get("lines") or [])
-    combined_kept = list(ocr_extra.get("kept_lines") or []) + list(header_extra.get("kept_lines") or [])
-    combined_text = "\n".join(
-        ln["text"] for ln in ocr_extra.get("kept_lines") or []
-    )
-    header_text = "\n".join(ln["text"] for ln in header_extra.get("kept_lines") or [])
-    if header_text:
-        combined_text = f"{combined_text}\n[HEADER OCR]\n{header_text}"
+    # 1b) OCR konteks tambahan: band header/logo (run_header) + zona tabel (layout).
+    zone_data = _zone_ocr(image_path, ocr_model)
+    zones_meta = zone_data["zones"]
+    zone_all_lines = zone_data["all_lines"]
+    zone_kept_lines = zone_data["kept_lines"]
+    header_meta = next((z for z in zones_meta if z.get("label") == "header"), {})
+
+    # Gabung teks konteks: halaman penuh + zona berlabel.
+    combined_text = "\n".join(ln["text"] for ln in ocr_extra.get("kept_lines") or [])
+    combined_lines = list(ocr_extra.get("lines") or []) + list(zone_all_lines)
+    combined_kept = list(ocr_extra.get("kept_lines") or []) + list(zone_kept_lines)
+    zone_contexts = [z["context_text"] for z in zones_meta if z.get("context_text")]
+    if zone_contexts:
+        combined_text = f"{combined_text}\n" + "\n".join(zone_contexts)
 
     decision = evaluate(
         combined_text,
@@ -180,7 +275,7 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
 
     fields = ext.fields if isinstance(ext.fields, dict) else {}
     # 3) Koreksi field kode/nomor dari OCR (PaddleOCR lebih akurat untuk kode).
-    all_lines = list(ocr_extra.get("all_lines") or []) + list(header_extra.get("all_lines") or [])
+    all_lines = list(ocr_extra.get("all_lines") or []) + list(zone_all_lines)
     fields = correct_codes_from_ocr(fields, all_lines)
     normalised = normalise_fields(fields)
     validation = validate_document(doc_type, normalised)
@@ -202,14 +297,18 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
             "reason": decision.reason,
             "stats": decision.stats,
             "elapsed_seconds": round(ocr_res.elapsed_seconds, 2),
-            "header_elapsed_seconds": round(header_res.elapsed_seconds, 2),
+            "zones_elapsed_seconds": round(
+                sum(z.get("elapsed_seconds", 0.0) for z in zones_meta), 2
+            ),
             # "Ambil semua dari gambar": seluruh baris OCR (tanpa filter) ikut
             # disimpan agar tidak ada nomor/teks penting yang terlewat.
             "all_text": ocr_extra.get("all_text", ""),
             "lines": ocr_extra.get("all_lines", []),
-            # OCR pas kedua khusus area header/logo (untuk nama di dalam logo).
-            "header_lines": header_extra.get("all_lines", []),
-            "header_text": header_extra.get("all_text", ""),
+            # OCR per-zona layout (band header + tabel).
+            "zones": zones_meta,
+            # Band header/logo (untuk nama perusahaan di dalam logo).
+            "header_lines": header_meta.get("lines", []),
+            "header_text": header_meta.get("text", ""),
         },
         "error": ext.error,
     }
