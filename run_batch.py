@@ -262,6 +262,7 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
                 "error": None,
                 "suspicious_lines_count": 0,
                 "corrections": [],
+                "insertions": [],
                 "handwritten_notes": [],
                 "review_changes": [],
                 "elapsed_seconds": 0.0,
@@ -304,6 +305,7 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
         "error": None,
         "suspicious_lines_count": 0,
         "corrections": [],
+        "insertions": [],
         "handwritten_notes": [],
         "review_changes": [],
         "elapsed_seconds": 0.0,
@@ -332,6 +334,7 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
                 else:
                     rextra = read_res.extra or {}
                     vlm_meta["corrections"] = rextra.get("corrections") or []
+                    vlm_meta["insertions"] = rextra.get("insertions") or []
                     vlm_meta["handwritten_notes"] = rextra.get("handwritten_notes") or []
                     cleaned = (rextra.get("cleaned_text") or "").strip()
                     # Teks bersih (nilai dicoret DIGANTI pembetulan) ikut ke NuExtract.

@@ -39,6 +39,7 @@ from config import (
     VLM_API_MAX_NEW_TOKENS,
     VLM_API_MAX_SIDE,
     VLM_API_MODEL,
+    VLM_API_READ_MAX_SIDE,
     VLM_API_TEMPERATURE,
     VLM_API_TIMEOUT,
 )
@@ -59,20 +60,31 @@ DETECT_PROMPT = (
 )
 
 READ_PROMPT = (
-    "Baca seluruh dokumen ini termasuk tulisan tangan, angka, dan koreksi.\n"
-    "Untuk setiap kata/angka yang DICORET (ada garis coret/overwrite), "
-    "identifikasi nilai asli yang dicoret DAN nilai pembetulan yang ditulis di "
-    "sebelahnya (jika ada).\n"
+    "Baca seluruh dokumen ini dengan teliti, termasuk teks KETIK (cetak), "
+    "TULISAN TANGAN, dan CORETAN di atas teks ketik.\n"
+    "Aturan interpretasi WAJIB:\n"
+    "1. Bila kata teks KETIK dicoret (garis coret / tanda X / scribble) dan ada "
+    "TULISAN TANGAN di dekatnya (atas/bawah/samping) -> itu PEMBETULAN: teks "
+    "ketik yang dicoret DIGANTI oleh tulisan tangan tersebut. Yang dicoret "
+    "SELALU teks ketik asli; tulisan tangan adalah HASIL pembetulan.\n"
+    "2. Bila ada TULISAN TANGAN di sela-sela teks ketik TANPA ada kata ketik "
+    "yang dicoret -> itu TAMBAHAN kata (insertion), bukan pembetulan.\n"
     "Kembalikan HANYA JSON valid dengan format:\n"
-    '{"handwritten_notes": [string], "corrections": [{"crossed_out": string, '
-    '"corrected": string, "location": string}], "cleaned_text": string}\n'
-    "- handwritten_notes: catatan tulisan tangan lain yang terbaca (jika ada).\n"
-    "- corrections: tiap koreksi coretan; crossed_out = nilai yang dicoret, "
-    "corrected = nilai pembetulan di sebelahnya, location = deskripsi posisinya "
-    "(mis. 'baris total', 'kolom qty').\n"
-    "- cleaned_text: seluruh teks dokumen (cetak + tulisan tangan) dengan nilai "
-    "pembetulan MENGGANTIKAN nilai yang dicoret.\n"
-    "Bila tidak ada coretan atau pembetulan, corrections = []."
+    '{"corrections": [{"crossed_out": string, "corrected": string, "location": string}], '
+    '"insertions": [{"inserted": string, "location": string}], '
+    '"handwritten_notes": [string], "cleaned_text": string}\n'
+    "- corrections: tiap PEMBETULAN; crossed_out = teks KETIK yang dicoret "
+    "(nilai asli), corrected = TULISAN TANGAN penggantinya, location = posisi "
+    "(mis. 'poin III.1', 'baris 2.7.4').\n"
+    "- insertions: tiap TAMBAHAN kata tulisan tangan yang TIDAK menggantikan "
+    "teks ketik yang dicoret; inserted = kata tambahan, location = posisinya.\n"
+    "- handwritten_notes: tulisan tangan lain yang tidak jelas fungsi/coretan "
+    "tanpa pembetulan.\n"
+    "- cleaned_text: seluruh teks dokumen hasil AKHIR — teks ketik dengan nilai "
+    "pembetulan MENGGANTIKAN yang dicoret, dan TAMBAHAN kata diselipkan di "
+    "posisinya.\n"
+    "Bila tidak ada coretan, corrections = []. Bila tidak ada tambahan, "
+    "insertions = []."
 )
 
 REVIEW_PROMPT = (
@@ -140,7 +152,7 @@ class VLMApiModel(BaseExtractionModel):
         gc.collect()
 
     # -- util gambar -------------------------------------------------------
-    def _encode_image(self, image_path: str) -> str:
+    def _encode_image(self, image_path: str, max_side: int = VLM_API_MAX_SIDE) -> str:
         """Encode gambar jadi data URI JPEG (fit sisi <= max_side)."""
         from PIL import Image
 
@@ -148,8 +160,8 @@ class VLMApiModel(BaseExtractionModel):
             im = im.convert("RGB")
             w, h = im.size
             side = max(w, h)
-            if side > VLM_API_MAX_SIDE:
-                scale = VLM_API_MAX_SIDE / side
+            if side > max_side:
+                scale = max_side / side
                 im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
             buf = io.BytesIO()
             im.save(buf, format="JPEG", quality=VLM_API_JPEG_QUALITY)
@@ -157,13 +169,19 @@ class VLMApiModel(BaseExtractionModel):
         return f"data:image/jpeg;base64,{b64}"
 
     # -- inference ---------------------------------------------------------
-    def _chat(self, image_path: str, text_prompt: str, max_new_tokens: int | None = None) -> str:
+    def _chat(
+        self,
+        image_path: str,
+        text_prompt: str,
+        max_new_tokens: int | None = None,
+        max_side: int = VLM_API_MAX_SIDE,
+    ) -> str:
         """Satu panggilan chat completion dengan gambar + prompt. Return teks."""
         self.load()
         if self._client is None:
             raise RuntimeError("Client VLM API tidak tersedia (panggil load() dulu).")
 
-        image_url = self._encode_image(image_path)
+        image_url = self._encode_image(image_path, max_side=max_side)
         messages = [
             {
                 "role": "user",
@@ -235,7 +253,8 @@ class VLMApiModel(BaseExtractionModel):
         """Baca coretan + pembetulan. extra["corrections"], extra["cleaned_text"]."""
         t0 = time.time()
         try:
-            text = self._chat(image_path, READ_PROMPT)
+            # Resolusi lebih tinggi agar tulisan tangan kecil terbaca.
+            text = self._chat(image_path, READ_PROMPT, max_side=VLM_API_READ_MAX_SIDE)
             data = extract_json(text)
             if not isinstance(data, dict):
                 raise ValueError("Output READ bukan objek JSON.")
@@ -245,6 +264,7 @@ class VLMApiModel(BaseExtractionModel):
                 time.time() - t0,
                 extra={
                     "corrections": data.get("corrections") or [],
+                    "insertions": data.get("insertions") or [],
                     "handwritten_notes": data.get("handwritten_notes") or [],
                     "cleaned_text": data.get("cleaned_text") or "",
                 },

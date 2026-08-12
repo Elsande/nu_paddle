@@ -56,8 +56,10 @@ VLM_API_TIMEOUT = int(os.environ.get("VLM_API_TIMEOUT", "180"))
 
 # Sisi terpanjang maksimal gambar yang dikirim (fit penuh halaman).
 VLM_API_MAX_SIDE = 1600
+# Read memakai resolusi lebih tinggi (tulisan tangan kecil lebih terbaca).
+VLM_API_READ_MAX_SIDE = 2400
 VLM_API_JPEG_QUALITY = 92
-VLM_API_MAX_NEW_TOKENS = 4096
+VLM_API_MAX_NEW_TOKENS = 8192
 VLM_API_TEMPERATURE = 0.0
 # Nonaktifkan chain-of-thought GLM (lebih cepat & deterministik).
 VLM_API_DISABLE_THINKING = True

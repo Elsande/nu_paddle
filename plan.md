@@ -251,15 +251,41 @@ corrections/handwritten_notes/review_changes/elapsed_seconds). Kegagalan API
 - Output GLM dibungkus `<|begin_of_box|>/<|end_of_box|>` dan model memakai
   `reasoning_content` dulu (gateway lokal MENGABAIKAN `thinking.disabled`) —
   `max_tokens` deteksi diperbesar (1024) + fallback parse dari reasoning.
+- Foto halaman padat (banyak teks) membuat reasoning panjang sehingga budget
+  token terpotong => `VLM_API_MAX_NEW_TOKENS=8192` (dokumentasi/pojok berisi
+  coretan butuh budget besar).
 - Heuristik dipakai 2 sinyal: confidence OCR **< 0.35** ATAU teks pendek dengan
   rasio simbol tinggi. Tanda baca umum cetak `(Rp)`, `PPH (%)` diabaikan.
   Semua 8 dokumen contoh = 0 baris mencurigakan => **0 panggilan API**.
 - Uji sintetis (nilai `116.550` dicoret + pembetulan `125.000`): detect=YA,
   read menangkap `crossed_out=116.550, corrected=125.000`, review mengoreksi
   field `total_amount`; NuExtract mengambil nilai pembetulan.
+- **Uji gambar asli (2 foto WhatsApp, test saja, bukan dokumen finance):**
+  detect=YA pada keduanya. Read berhasil membaca coretan + pembetulan:
+  gambar 1 -> `150 27001 : 2022`→`ISO/IEC 27001 ...`, `1EC`→`IEC`,
+  `pelathan`→`security`; gambar 2 -> `asuransi`→`supplier`. cleaned_text
+  memakai nilai pembetulan. (GLM terbukti jalan untuk tulisan tangan/coretan.)
+- **Prompt read diperbaiki (2 aturan interpretasi):** tulisan tangan bisa
+  PEMBETULAN (teks KETIK dicoret -> diganti tulisan tangan) ATAU TAMBAHAN kata
+  (insertion, tanpa coretan). Output JSON kini punya `corrections[]` +
+  `insertions[]` (struktur `{inserted, location}`). Test: insertion `security`
+  di poin 2.11 terbaca benar; `(segregation of duties)`/`(pelatihan security
+  awareness)` di gambar 1 terbaca benar.
+- **Perbandingan model (gambar asli, data nyata):**
+  - `qwen/qwen3-vl-30b` lebih akurat baca tulisan tangan: ejaan tepat
+    (`segregation of duties`, `pelatihan security awareness`, `pihak ketiga`)
+    dan lokasi poin benar.
+  - `glm-4.6v-flash` (flash) membaca isi tapi ejaan sering garbled
+    (`regregation`, `pelathan`, `pihak kelga`).
+  - Keduanya masih keliru pada atribusi kata yang dicoret tanda X/garis
+    (bukan nama kata yang salah dibaca, tapi arah coretan-vs-pembetulan).
+  - Ganti model cukup ubah env `VLM_API_MODEL` (config model-agnostic).
+- **Preprocessing membantu:** kirim gambar hasil `preprocess()` (bukan foto
+  mentah) memperbaiki keterbacaan tulisan tangan. Di pipeline produksi VLM
+  sudah menerima gambar ter-preprocess (`run_batch.prepare_image`).
 - Keterbatasan: font yang di-render tidak bisa "menipu" PaddleOCR (conf tetap
-  tinggi) — verifikasi menyeluruh butuh dokumen asli ber-coretan (menunggu dari
-  user). Threshold di `selection/selector.py` mudah di-tuning.
+  tinggi) — untuk pemicu penuh butuh tulisan tangan asli (sudah teruji pada
+  foto asli). Threshold di `selection/selector.py` mudah di-tuning.
 
 ---
 
