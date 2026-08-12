@@ -1,318 +1,375 @@
-# nu-paddle — Plan & Dokumentasi
+# Arsitektur Pipeline `doc-validation` — Dokumentasi Lengkap
 
-> **Arsitektur:** NuExtract3-GGUF sebagai **model utama** (ekstraksi JSON
-> terstruktur) dibantu **PaddleOCR** sebagai **OCR pendukung** (sumber teks +
-> confidence), dengan **preprocessing** yang diambil dari project
-> `AI-Document/preprocessing` agar setiap dokumen melewati perbaikan gambar
-> yang layak (quality check → deskew [off] → denoise → contrast → sharpen →
-> resize).
->
-> Project ini adalah **gabungan** dari tiga project lama:
-> `doc-validation` (NuExtract3-GGUF + validasi), `paddleocr`
-> (PaddleOCR detect-then-recognize), dan `AI-Document` (preprocessing +
-> pola arsitektur app/registry/selection) — hanya bagian yang benar-benar
-> dipakai yang dibawa ke sini.
+Dokumen ini menjelaskan alur final pipeline ekstraksi & validasi dokumen bisnis Indonesia (Invoice, Kwitansi, Faktur Pajak, Berita Acara, Delivery Order, PO), lengkap dengan alasan tiap keputusan arsitektur, model yang dipakai, dan prompt siap pakai.
 
 ---
 
-## 1. Tujuan
-
-1. Menjaga **NuExtract3-GGUF sebagai ekstraktor utama** (hasil akhir JSON
-   terstruktur, sudah terbukti akurat pada field numerik/tanggal).
-2. **PaddleOCR membantu** memberi teks konteks yang **bersih** agar NuExtract
-   tidak meleset pada field nama/perusahaan.
-3. **Semua dokumen wajib lewat preprocessing yang layak** (dari AI-Document)
-   supaya tidak ada dokumen yang terlewat/miss.
-4. Fase-1: **batch extraction semua dokumen contoh** untuk melihat hasil
-   sebelum membangun UI.
-
----
-
-## 2. Struktur Folder
+## 1. Ringkasan Arsitektur
 
 ```
-nu-paddle/
-├── .gitignore
-├── plan.md                     # dokumen ini
-├── AGENT.md                    # aturan kerja untuk agent/coder
-├── requirements.txt
-├── config.py                   # path model, threshold, pemetaan jenis dokumen
-├── run_batch.py                # ENTRY POINT fase-1 (batch)
-├── preprocessing/              # SALINAN dari AI-Document/preprocessing
-│   └── pipeline.py             #   preprocess() wajib untuk semua dokumen
-├── models/                     # pola AI-Document/models/
-│   ├── base.py                 #   ModelResult + BaseExtractionModel
-│   ├── paddleocr_model.py      #   PaddleOCR (role="support") + run_region/run_header
-│   ├── layout_model.py         #   PP-DocLayoutV3 (deteksi zona layout, offline)
-│   ├── nuextract_gguf_model.py #   NuExtract3-GGUF (role="main")
-│   └── registry.py             #   AVAILABLE_MODELS
-├── extraction/
-│   ├── nuextract3_chat_template.jinja   # template wajib NuExtract
-│   └── schemas.py              #   schema + instruksi per jenis dokumen
-├── selection/
-│   └── selector.py             #   kapan teks OCR ikut dikirim ke NuExtract
-├── validation.py               # normalisasi + validasi PASSED/FAILED
-├── data/models/nuextract3/     # GGUF Q4_K_M (2.6G) + mmproj (645M) [disalin]
-├── contoh invoice/             # 8 dokumen contoh (2 vendor)
-└── results/                    # output JSON per dokumen [tidak di-commit]
+[Gambar Dokumen]
+        │
+        ├──► paddleocr       (selalu jalan, ringan)
+        ├──► qwen3-vl-30b        (selalu jalan, berat)
+        ├──► glm-4.6v-flash      (selalu jalan, berat)
+        └──► NuExtract3          (selalu jalan, ringan)
+                    │
+                    ▼
+        ┌───────────────────────────┐
+        │      FUSION LAYER          │  ← rule-based, field-aware
+        └───────────────────────────┘
+                    │
+        (kondisional, hanya jika ada konflik qwen3-vl vs glm-4.6v)
+                    │
+                    ▼
+        gemma4:31b (tie-breaker, on-demand)
+                    │
+                    ▼
+        NuExtract3 (Structuring & Validasi Format)
+                    │
+                    ▼
+        Arithmetic Validator
+                    │
+                    ▼
+        ERP Fuzzy Matching
+                    │
+                    ▼
+        [OUTPUT FINAL: JSON valid / flag review manual]
+```
+
+**Total model yang dipakai: 5** — paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (dipakai 2x di 2 slot berbeda), dan gemma4:31b (on-demand saja).
+
+---
+
+## 2. Kenapa Arsitekturnya Begini — Penjelasan Tiap Keputusan
+
+### 2.1. Kenapa 4 sumber ekstraksi jalan PARALEL, bukan berurutan?
+
+Keempat sumber (paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3) sama-sama membaca **gambar dokumen yang sama**, dari titik nol, secara independen — tidak ada satupun yang butuh hasil dari sumber lain untuk mulai bekerja.
+
+- Kalau dijalankan berurutan (satu selesai, baru yang berikutnya mulai), total waktu proses = penjumlahan waktu semua model = lambat.
+- Kalau dijalankan paralel, total waktu proses = waktu model yang paling lambat saja.
+
+**Kesimpulan:** paralel adalah pilihan yang benar karena tidak ada dependency antar sumber di tahap ini.
+
+### 2.2. Kenapa harus 4 sumber, bukan cukup 1?
+
+Setiap sumber punya kekuatan dan kelemahan berbeda — kombinasinya saling menutupi:
+
+| Sumber | Kekuatan | Kelemahan |
+|---|---|---|
+| paddleocr | Akurat di level karakter/posisi (bounding box) | Tidak paham konteks/makna, gagal di layout rumit |
+| qwen3-vl-30b | Paham konteks semantik, bisa baca tulisan tangan | Berat, kadang halusinasi angka |
+| glm-4.6v-flash | Kuat di dense document/table parsing, arsitektur beda dari Qwen (bagus untuk cross-check) | Berat |
+| NuExtract3 | Sangat konsisten mengikuti schema JSON, ringan (4B) | **Tidak bisa membaca tulisan tangan sama sekali** |
+
+Kalau cuma pakai 1 sumber, error dari sumber itu langsung lolos tanpa ada yang mengoreksi. Dengan 4 sumber, **fusion layer** bisa membandingkan dan mengambil keputusan per-field berdasarkan siapa yang paling bisa dipercaya untuk jenis field tersebut.
+
+### 2.3. Kenapa paddleocr dan NuExtract3 "selalu jalan", tapi gemma4:31b cuma "on-demand"?
+
+Alasannya murni **cost/beban komputasi**, bukan soal akurasi:
+
+- **paddleocr** bukan LLM generatif — dia OCR engine biasa, sangat ringan dan cepat. Tidak ada alasan untuk tidak menjalankannya tiap dokumen.
+- **NuExtract3** cuma 4 miliar parameter — jauh lebih kecil dari qwen3-vl-30b (30B) atau glm-4.6v-flash. Biaya menjalankan dia tiap dokumen kecil.
+- **gemma4:31b** setara besar dengan qwen3-vl-30b (puluhan miliar parameter) — mahal kalau dipanggil di setiap dokumen, padahal di sebagian besar kasus qwen3-vl-30b dan glm-4.6v-flash sudah **sepakat** satu sama lain. Maka gemma4:31b hanya dipanggil sebagai **tie-breaker**, khusus untuk field yang hasilnya berbeda antara qwen3-vl-30b dan glm-4.6v-flash — bukan untuk seluruh dokumen.
+
+**Alur kondisionalnya:**
+```
+qwen3-vl-30b dan glm-4.6v-flash selesai
+        │
+        ▼
+Ada field yang hasilnya BEDA di antara keduanya?
+        │
+   ┌────┴────┐
+  Tidak      Ya
+   │          │
+langsung   panggil gemma4:31b, HANYA untuk field
+ke fusion  yang berbeda tersebut (bukan re-run
+           seluruh dokumen)
+   │          │
+   └────┬─────┘
+        ▼
+   Fusion layer
+```
+
+### 2.4. Kenapa NuExtract3 tidak boleh "vote" di field tulisan tangan?
+
+NuExtract3 memang **tidak dilatih untuk membaca tulisan tangan/handwriting** — ini sudah dikonfirmasi lewat pengecekan langsung. Kalau dipaksa memberi nilai untuk field yang sebenarnya berasal dari coretan tangan (misalnya koreksi manual, paraf, catatan tambahan di margin dokumen), dia hanya akan:
+- Mengembalikan `null` (karena memang tidak terbaca olehnya), atau
+- Menebak salah, yang justru **menurunkan confidence score** hasil fusion.
+
+**Solusi:** fusion layer harus bersifat **field-aware** — dia tahu field mana yang boleh menerima suara dari sumber mana:
+
+| Jenis Field | Sumber yang Boleh Vote |
+|---|---|
+| Teks cetak (nomor dokumen, tanggal, nominal, nama pihak, item) | paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (4 suara) |
+| Tulisan tangan / anotasi / koreksi manual | qwen3-vl-30b, glm-4.6v-flash saja (2 suara, PaddleOCR & NuExtract3 di-exclude) |
+
+### 2.5. Kenapa fusion layer HARUS ada — tidak bisa langsung ke output?
+
+Karena setiap sumber punya cara baca dan tingkat kepercayaan berbeda per jenis field (lihat tabel di 2.2), harus ada satu titik keputusan yang menentukan, untuk setiap field, nilai mana yang paling bisa dipercaya. Tanpa fusion layer, sistem akan punya 4 versi data berbeda tanpa cara menentukan mana yang benar.
+
+**Rule prioritas per jenis field (dipakai fusion layer):**
+
+| Tipe Field | Prioritas Utama | Alasan |
+|---|---|---|
+| Numerik (harga, qty, total, subtotal, pajak) | VLM (qwen3-vl / glm-4.6v) | Paham konteks tabel, bisa membedakan "Total" vs "Subtotal" walau posisinya berdekatan |
+| ID/Kode (nomor dokumen, NPWP, nomor PO) | paddleocr | Akurat di level karakter literal |
+| Teks bebas (nama pihak, catatan) | VLM, dengan fallback ke PaddleOCR jika confidence VLM rendah | Butuh pemahaman konteks, tapi tetap perlu validasi karakter |
+| Schema-critical (format wajib konsisten) | NuExtract3 sebagai tie-breaker | Dilatih khusus schema-adherence |
+| Tulisan tangan / anotasi | qwen3-vl-30b, glm-4.6v-flash (majority vote 2 sumber) | Hanya sumber ini yang punya kapabilitas baca handwriting |
+
+### 2.6. Kenapa NuExtract3 dipakai DUA KALI — di awal (extraction) dan di akhir (structuring)?
+
+Ini poin penting yang sering disalahpahami. NuExtract3 dipakai di **dua slot berbeda dengan input berbeda**, bukan dipanggil dua kali untuk kerjaan yang sama:
+
+**Slot 1 — Extraction (sebelum fusion):**
+- Input: **gambar dokumen** (mentah)
+- Tugas: baca teks cetak langsung dari gambar, hasilkan JSON semi-final
+- Nilai unik di sini: dia jadi salah satu "opini independen" tambahan yang membaca gambar yang sama dengan sudut pandang berbeda dari PaddleOCR/qwen3-vl/glm-4.6v — menambah keragaman suara untuk voting di fusion layer, khususnya karena kekuatan schema-adherence-nya.
+
+**Slot 2 — Structuring & Validasi Format (setelah fusion):**
+- Input: **teks/JSON hasil fusion** (bukan gambar lagi)
+- Tugas: normalisasi hasil fusion ke schema JSON final (format tanggal `YYYY-MM-DD`, angka jadi number murni, dsb)
+- Nilai unik di sini: dia menggantikan qwen2.5-coder-32b/qwen3.6:35b yang jauh lebih besar, karena tugas reformat teks-ke-JSON tidak butuh model besar — kapabilitas vision NuExtract3 juga tidak dipakai sama sekali di slot ini (karena memang tidak ada gambar), murni soal efisiensi kecepatan/biaya.
+
+**Kenapa TIDAK ditaruh HANYA di satu slot saja:**
+- Kalau NuExtract3 hanya dipakai di slot extraction: peran structuring akhir tetap harus diisi model lain (qwen2.5-coder/qwen3.6:35b) yang jauh lebih besar — boros compute padahal NuExtract3 sendiri sudah cukup ringan dan mampu untuk kerjaan itu.
+- Kalau NuExtract3 hanya dipakai di slot structuring: kapabilitas vision-nya (baca gambar langsung ke schema) jadi sama sekali tidak dimanfaatkan, padahal itu justru kekuatan utamanya.
+
+**Kesimpulan:** memakainya di dua slot bukan duplikasi kerja — di slot 1 dia adalah salah satu "mata" (pembaca gambar), di slot 2 dia adalah "tangan" (perapi format). Dua peran berbeda, dua nilai berbeda, dan justru inilah yang membuat arsitektur ini jadi jauh lebih ringan dibanding memakai qwen2.5-coder-32b/qwen3.6:35b di slot structuring.
+
+### 2.7. Kenapa Arithmetic Validator dan ERP Fuzzy Matching tetap terpisah di akhir, bukan digabung ke fusion/structuring?
+
+- **Arithmetic Validator** mengecek logika matematis (qty × harga = subtotal baris, jumlah subtotal + pajak = total) — ini butuh SEMUA field sudah final dan dalam format angka murni. Kalau dijalankan sebelum structuring selesai, datanya belum tentu bersih (masih ada "Rp", titik ribuan, dsb), jadi hasil pengecekan bisa salah.
+- **ERP Fuzzy Matching** mencocokkan data ke sistem ERP (PO number, nama vendor, kode barang) — ini butuh data yang sudah divalidasi secara matematis dulu, supaya tidak mencocokkan data yang sudah jelas salah secara logika.
+
+Urutan ini memastikan setiap tahap bekerja dengan data yang sudah "bersih" dari tahap sebelumnya, sehingga error tidak menumpuk atau menyebar ke tahap berikutnya.
+
+---
+
+## 3. Alur Step-by-Step Lengkap
+
+**Step 1 — Input**
+Dokumen (Invoice/Kwitansi/Faktur Pajak/Berita Acara/Delivery Order/PO) masuk sebagai gambar (hasil scan/foto).
+
+**Step 2 — Ekstraksi Paralel (4 sumber, selalu jalan bersamaan)**
+- paddleocr membaca teks cetak berbasis deteksi karakter/posisi.
+- qwen3-vl-30b membaca teks cetak dan tulisan tangan secara semantik.
+- glm-4.6v-flash membaca teks cetak dan tulisan tangan sebagai pembanding arsitektur berbeda.
+- NuExtract3 membaca teks cetak langsung ke format JSON schema-strict.
+
+Keempatnya menghasilkan output JSON per-field dengan confidence score masing-masing.
+
+**Step 3 — Pengecekan Konflik**
+Sistem membandingkan hasil qwen3-vl-30b dan glm-4.6v-flash secara khusus, field per field.
+- Jika semua field sepakat → lanjut ke Step 5.
+- Jika ada field yang berbeda → lanjut ke Step 4.
+
+**Step 4 — Tie-Breaking (kondisional)**
+gemma4:31b dipanggil, tapi HANYA untuk field yang berbeda dari Step 3 — bukan seluruh dokumen. Hasilnya dipakai sebagai suara ketiga untuk majority vote di field tersebut.
+
+**Step 5 — Fusion Layer**
+Sistem menggabungkan semua hasil ekstraksi menjadi satu representasi konsolidasi, dengan aturan:
+- Field teks cetak: voting dari paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (dan gemma4:31b jika dipanggil).
+- Field tulisan tangan: voting hanya dari qwen3-vl-30b dan glm-4.6v-flash (dan gemma4:31b jika dipanggil) — paddleocr dan NuExtract3 di-exclude dari field ini.
+- Setiap field diberi label `source_used` dan `had_conflict` untuk keperluan audit.
+
+**Step 6 — Structuring & Validasi Format**
+NuExtract3 (slot kedua, menerima teks/JSON hasil fusion — bukan gambar) merapikan hasil fusion menjadi JSON final sesuai schema baku: format tanggal `YYYY-MM-DD`, angka murni tanpa simbol mata uang/pemisah ribuan, field yang masih ada konflik ditandai di `review_flags`.
+
+**Step 7 — Arithmetic Validator**
+Sistem mengecek logika matematis dokumen: apakah qty × harga satuan = subtotal baris, apakah jumlah semua subtotal + pajak = total. Jika tidak cocok, field terkait ditandai untuk review manual.
+
+**Step 8 — ERP Fuzzy Matching**
+Data yang sudah tervalidasi dicocokkan ke data ERP (nomor PO, nama vendor, kode barang) menggunakan fuzzy matching untuk menangani variasi penulisan/typo.
+
+**Step 9 — Output Final**
+Hasil akhir berupa JSON terstruktur, siap dipakai sistem downstream, atau ditandai "perlu review manual" jika ada field dengan confidence rendah atau tidak cocok dengan data ERP.
+
+---
+
+## 4. Prompt Siap Pakai
+
+### 4.1. Prompt Extraction — VLM (qwen3-vl-30b & glm-4.6v-flash)
+
+Gunakan prompt yang SAMA PERSIS untuk kedua model ini, supaya hasilnya bisa dibandingkan secara adil di fusion layer.
+
+```
+SYSTEM:
+Kamu adalah sistem ekstraksi dokumen bisnis Indonesia. Tugasmu HANYA membaca
+dan mengekstrak informasi yang benar-benar terlihat di gambar. Jangan
+menebak, menghitung, atau melengkapi data yang tidak tertulis.
+
+Aturan:
+1. Baca seluruh teks tercetak (typed/printed text) di dokumen.
+2. Jika ada tulisan tangan (handwriting), coretan, atau catatan tambahan,
+   ekstrak TERPISAH dari teks cetak dan tandai dengan field "is_handwritten": true.
+3. Jika ada teks yang dicoret (strikethrough) dan diganti tulisan tangan,
+   laporkan KEDUA versi: nilai asli (dicoret) dan nilai koreksi (tulisan tangan).
+4. Jika suatu field tidak terbaca jelas atau tidak ada di dokumen, isi
+   dengan null — JANGAN mengarang nilai.
+5. Untuk setiap field, berikan confidence 0.0-1.0 berdasarkan kejelasan
+   visual teks tersebut (bukan berdasarkan asumsi logis).
+6. Jangan menerjemahkan istilah Indonesia ke Inggris. Pertahankan bahasa asli.
+
+Output HARUS berupa JSON valid saja. Tidak ada teks pembuka, penutup,
+atau penjelasan di luar JSON.
+
+USER:
+Berikut gambar dokumen bisnis. Ekstrak seluruh informasi yang terlihat
+ke format berikut:
+
+{
+  "jenis_dokumen_terdeteksi": "<string atau null>",
+  "nomor_dokumen": {"value": "<string atau null>", "confidence": 0.0},
+  "tanggal": {"value": "<string atau null>", "confidence": 0.0},
+  "pihak_pengirim": {"value": "<string atau null>", "confidence": 0.0},
+  "pihak_penerima": {"value": "<string atau null>", "confidence": 0.0},
+  "items": [
+    {
+      "nama_barang_jasa": {"value": "<string>", "confidence": 0.0},
+      "qty": {"value": "<number atau null>", "confidence": 0.0},
+      "satuan": {"value": "<string atau null>", "confidence": 0.0},
+      "harga_satuan": {"value": "<number atau null>", "confidence": 0.0},
+      "subtotal_baris": {"value": "<number atau null>", "confidence": 0.0}
+    }
+  ],
+  "subtotal": {"value": "<number atau null>", "confidence": 0.0},
+  "pajak": {"value": "<number atau null>", "confidence": 0.0},
+  "total": {"value": "<number atau null>", "confidence": 0.0},
+  "catatan_tercetak": {"value": "<string atau null>", "confidence": 0.0},
+  "anotasi_tulisan_tangan": [
+    {
+      "teks": "<string>",
+      "lokasi_referensi": "<field/bagian mana yang dianotasi>",
+      "jenis": "<koreksi|catatan_tambahan|paraf|tidak_diketahui>",
+      "confidence": 0.0
+    }
+  ]
+}
+```
+
+### 4.2. Prompt Extraction — NuExtract3 (schema template, teks cetak saja)
+
+NuExtract3 tidak perlu instruksi panjang seperti VLM di atas — dia dilatih untuk langsung mengikuti JSON template. Cukup berikan gambar + template berikut (tanpa field `anotasi_tulisan_tangan`, karena dia tidak akan bisa mengisinya):
+
+```
+Template:
+{
+  "jenis_dokumen_terdeteksi": "string",
+  "nomor_dokumen": "string",
+  "tanggal": "string",
+  "pihak_pengirim": "string",
+  "pihak_penerima": "string",
+  "items": [
+    {
+      "nama_barang_jasa": "string",
+      "qty": "number",
+      "satuan": "string",
+      "harga_satuan": "number",
+      "subtotal_baris": "number"
+    }
+  ],
+  "subtotal": "number",
+  "pajak": "number",
+  "total": "number",
+  "catatan_tercetak": "string"
+}
+
+Instruksi: Ekstrak hanya teks tercetak/typed dari gambar dokumen ini
+sesuai template di atas. Jangan menebak nilai yang tidak terlihat jelas —
+isi dengan null.
+```
+
+### 4.3. Konfigurasi paddleocr (bukan prompt, tapi format output wajib)
+
+```
+Output paddleocr wajib di-post-process ke struktur:
+{
+  "raw_text_blocks": [
+    {"text": "<string>", "bbox": [x1,y1,x2,y2], "confidence": 0.0}
+  ]
+}
+```
+Mapping `raw_text_blocks` ke field-field yang sama seperti schema VLM di atas dilakukan lewat heuristik posisi/label terdekat.
+
+### 4.4. Prompt Fusion Layer (rule-based, direkomendasikan — tanpa LLM)
+
+```python
+FIELD_PRIORITY = {
+    "numeric": ["vlm_qwen3", "vlm_glm", "gemma_tiebreak", "paddleocr", "nuextract3"],
+    "id_code": ["paddleocr", "vlm_qwen3", "vlm_glm", "nuextract3"],
+    "free_text": ["vlm_qwen3", "paddleocr", "vlm_glm", "nuextract3"],
+    "schema_critical": ["nuextract3", "vlm_qwen3", "vlm_glm"],
+    "handwriting": ["vlm_qwen3", "vlm_glm", "gemma_tiebreak"],  # paddleocr & nuextract3 di-exclude
+}
+CONFIDENCE_OVERRIDE_THRESHOLD = 0.3
+
+def fuse_field(field_name, field_type, sources: dict):
+    # sources hanya berisi sumber yang diizinkan untuk field_type ini
+    values = {k: v["value"] for k, v in sources.items() if v["value"] is not None}
+    if len(set(values.values())) <= 1:
+        return {"value": next(iter(values.values()), None),
+                "confidence": avg([v["confidence"] for v in sources.values()]),
+                "source_used": "consensus", "had_conflict": False}
+
+    ordered = FIELD_PRIORITY[field_type]
+    ordered = [s for s in ordered if s in sources]  # hanya sumber yang tersedia
+    best_source = max(ordered, key=lambda s: sources[s]["confidence"])
+    default_source = ordered[0]
+    winner = best_source if (
+        sources[best_source]["confidence"] - sources[default_source]["confidence"]
+        > CONFIDENCE_OVERRIDE_THRESHOLD
+    ) else default_source
+
+    return {"value": sources[winner]["value"],
+            "confidence": sources[winner]["confidence"],
+            "source_used": winner, "had_conflict": True,
+            "alternatives": {k: v["value"] for k, v in sources.items() if k != winner}}
+```
+
+### 4.5. Prompt Structuring & Validasi Format — NuExtract3 (slot kedua)
+
+```
+Template:
+{
+  "jenis_dokumen": "string",
+  "nomor_dokumen": "string",
+  "tanggal": "string (format YYYY-MM-DD)",
+  "pihak_pengirim": "string",
+  "pihak_penerima": "string",
+  "items": [
+    {"nama": "string", "qty": "number", "satuan": "string",
+     "harga_satuan": "number", "subtotal_baris": "number"}
+  ],
+  "subtotal": "number",
+  "pajak": "number",
+  "total": "number",
+  "catatan": "string",
+  "anotasi_tulisan_tangan": [
+    {"teks": "string", "lokasi_referensi": "string", "jenis": "string"}
+  ],
+  "review_flags": "array of string"
+}
+
+Instruksi: Input di bawah adalah hasil fusion dari beberapa sumber ekstraksi
+dokumen (bukan gambar). Ubah menjadi JSON sesuai template:
+- Normalisasi semua field numerik menjadi number murni (hilangkan "Rp",
+  titik/koma pemisah ribuan).
+- Normalisasi tanggal ke format YYYY-MM-DD.
+- Field yang punya flag "had_conflict": true dari data input, masukkan
+  nama field-nya ke "review_flags".
+- Jangan menghitung ulang subtotal/total — hanya reformat nilai yang ada.
+
+Input hasil fusion: {{fused_json}}
 ```
 
 ---
 
-## 3. Alur Per Dokumen (fase-1, `run_batch.py`)
+## 5. Rekomendasi Testing Sebelum Full Deploy
 
-```text
-dokumen (PDF/gambar)
-   │
-   ▼
-1. preprocess() [AI-Document pipeline]
-   pdf_to_image -> quality_check -> [deskew OFF] -> denoise
-   -> contrast (CLAHE) -> sharpen -> resize      -> gambar PNG bersih
-   │
-   ▼
-2. PaddleOCR (support) — detect-then-recognize + CLAHE + spatial sort
-   -> baris teks + confidence + bbox
-   +
-   OCR per-layout (PP-DocLayoutV3, model lokal/offline):
-   - band header/logo: run_header() crop 22% atas + upscale 2x (nama perusahaan
-     di dalam logo — sengaja TIDAK pakai bbox zona karena teks logo melewati
-     batas zona header_image/header, wide-band terbukti lebih akurat)
-   - zona table: PP-DocLayoutV3 -> crop bbox zona + upscale 1.8x (cap 2400px)
-     untuk angka kecil di tabel
-   Model layout dimuat per kebutuhan lalu langsung di-unload (hemat RAM).
-   │
-   ▼
-3. selector.evaluate() — TANPA aturan pemblokiran:
-   teks kosong  -> teks OCR dilewati
-   selebihnya   -> teks OCR disertakan
-   │
-   ▼
-4. NuExtract3-GGUF (main)
-   gambar (di-fit <=900k px) + teks OCR gabungan ([ZONA: header], [ZONA: table]) + schema
-   -> JSON terstruktur (field)
-   │
-   ▼
-5. koreksi dari OCR: `correct_codes_from_ocr()` (field kode/nomor + NPWP dari
-   baris ber-conf tinggi) -> normalisasi (tanggal ISO, uang angka) -> validasi
-   (field wajib, angka positif, tanggal valid) -> PASSED/FAILED
-   │
-   ▼
-6. simpan results/<jenis>_<nama>.json + tabel
-```
-
----
-
-## 4. Keputusan Desain & Temuan
-
-| # | Keputusan | Alasan |
-|---|-----------|--------|
-| 1 | **Deskew DINONAKTIFKAN** (`USE_DESKEW=False`) | Temuan kritis fase-1: `minAreaRect` mengembalikan sudut **90°** pada halaman yang sebenarnya lurus → deskewer meng-rotasi **-90°** → baris teks kecil (header: No. Invoice, Tanggal, nama) **hilang dari deteksi PaddleOCR** (51 → 34 baris, header `0685/ISA/INV/VI/26` tidak terbaca → NuExtract mengarang `PO-578`/`2020-08-28`). Konsisten dengan temuan project `paddleocr` (agent_guide.md: deskew merusak → dimatikan). Sudut di normalisasi ulang (±90→0) + toggle. |
-| 2 | **NuExtract3-GGUF = main, PaddleOCR = support** | Sesuai keinginan user & rencana `doc-validation/PLAN.md`. NuExtract output JSON; PaddleOCR hanya teks konteks. |
-| 3 | **Teks OCR hanya konteks** | Gambar tetap sumber utama (bukti: notebook RapidOCR mengirim OCR garbled → nama jadi salah `PT. INTISOLUSINDO GABADI`). Selector filter confidence >= 0.6. |
-| 4 | **Guard gambar <= 900k px** | llama.cpp CLIP/mmproj **segfault** di atas ~1 MP (temuan project doc-validation). Wajib `fit_image_for_vision`. |
-| 5 | **Preprocessing pakai PyMuPDF** (bukan poppler) | Render PDF→gambar self-contained, zoom agar lebar >= 1800 px. |
-| 6 | **PaddleX di-patch offline** | Memakai model lokal `~/.paddlex/official_models` (PP-OCRv6), tidak download. |
-| 7 | **Quality gate non-strict** (`STRICT_QUALITY_GATE=False`) | Blur/resolusi tetap dicatat di hasil, tapi dokumen tetap diproses (anti miss). |
-| 8 | **Venv baru khusus** + **model disalin** | Folder standalone (tidak bergantung path lama). |
-| 9 | **`kwitansi_number` tidak wajib** | Dokumen kwitansi ekadata memang tidak mencetak No. Kwitansi → kalau wajib, hasil jujur (`null`) salah ditandai FAILED. |
-| 10 | **Prioritas instruksi: OCR = sumber nilai persis** | Sebelumnya "gambar yang paling menentukan" → NuExtract mengalahkan OCR yang benar (`POBSP`→`POISSP`). Dibalik: teks OCR paling akurat untuk kode/angka/tanggal/nama; gambar hanya untuk layout bila OCR tak jelas. |
-| 11 | **Koreksi field kode/nomor dari OCR** (`correct_codes_from_ocr`) | PaddleOCR lebih akurat untuk kode: field kode/nomor diperbaiki dari baris OCR ber-conf ≥0.95 yang hampir identik; NPWP diambil dari baris `NPWP:`. Nilai model yang sudah benar tidak dirusak (edit-distance kecil + conf tinggi). |
-| 12 | **OCR per-layout (PP-DocLayoutV3)** | Deteksi zona `header_image`/`header`/`table` (offline). Band header/logo memakai wide-band `run_header` (bukan bbox zona — teks logo melewati batas zona), zona `table` dicrop + upscale 1.8x (cap 2400px). Model layout dimuat per dokumen lalu di-unload (hemat RAM). |
-| 10 | **`results/`, model, venv di-gitignore** | Output + biner besar tidak di-commit. |
-
----
-
-## 5. Skema Per Jenis Dokumen
-
-Deteksi jenis dari nama file (fallback: `invoice`):
-`Invoice`/`INV_` → invoice · `FP_`/`Faktur` → tax_invoice · `Kwitansi`/`Kuitansi` → kwitansi · `PO_` → purchase_order · `DO_`/`Surat Jalan` → delivery_order
-
-| Jenis | Field |
-|-------|-------|
-| invoice | invoice_number, invoice_date, due_date, **po_number, po_date**, supplier_name, customer_name, total_amount, tax_amount, currency, line_items[] |
-| purchase_order | po_number, po_date, **cf_code**, supplier_name, buyer_name, total_amount, currency |
-| delivery_order | do_number, do_date, **po_number, po_date**, supplier_name, recipient_name, delivery_address, total_items |
-| kwitansi | kwitansi_number, kwitansi_date, company_name, invoice_reference, total_value, materai_present |
-| tax_invoice | tax_invoice_number, invoice_date, supplier_name, supplier_tax_number, total_amount, tax_amount |
-
----
-
-## 6. Cara Pakai
-
-```bash
-cd nu-paddle
-
-# Batch SEMUA dokumen contoh (8 dokumen, ±12 menit)
-./run.sh
-# atau: venv/bin/python run_batch.py
-
-# Dokumen tertentu
-./run.sh "contoh invoice/Intisolusindo/Invoice_intisolusindo.pdf"
-
-# UI Gradio (browser) — upload banyak dokumen sekaligus ATAU ekstrak semua contoh
-./run.sh --ui                # http://127.0.0.1:7860
-./run.sh --ui --share        # link publik sementara
-```
-
-Hasil: `results/<jenis>_<nama>.json` (JSON lengkap: preprocessing, fields,
-normalised, validation, **seluruh teks OCR `ocr.all_text` + baris `ocr.lines`**,
-waktu). UI menampilkan tabel ringkasan + JSON detail; upload otomatis
-memproses (tanpa klik), tombol **"Ekstrak Semua Contoh"** memproses semua
-dokumen contoh. Tidak ada pemilihan model — keduanya dipakai otomatis.
-
----
-
-## 7. Hasil Fase-1 (8/8 PASSED)
-
-Waktu rata-rata ± 87 detik/dokumen (CPU; PaddleOCR ~15-17s + NuExtract ~45-70s).
-
-| Dokumen | Jenis | Status | Catatan kualitas |
-|---------|-------|--------|------------------|
-| Invoice_intisolusindo | invoice | PASSED | `0685/ISA/INV/VI/26`, tanggal 2026-06-02, supplier INTI SOLUSINDO, customer Surya Multi Cemerlang, total 116550 — **semua benar** |
-| DO_intisolusindo | delivery_order | PASSED | 0692/ISA/DO/VI/26, semua benar; supplier minor typo logo "JNTI" |
-| PO_intisolusindo | purchase_order | PASSED | POBSP-260529-000003, supplier/buyer benar |
-| Kuitansi_intisolusindo | kwitansi | PASSED | KWT/0685-ISA/V1/2026 (V1 vs VV minor), total 116550 |
-| FP_intisolusindo | tax_invoice | PASSED | No. FP benar; NPWP salah baca digit |
-| INV_Ekadata | invoice | PASSED | invoice_number `12032` (INVOICE RETAIL-12032-AKSESCALL, benar); statement No. terpisah |
-| FP_ekadata | tax_invoice | PASSED | No. FP benar; NPWP salah baca digit |
-| KUITANSI_Ekadata | kwitansi | PASSED | Tanpa No. Kwitansi di dokumen (jujur `null`, validasi disesuaikan) |
-
-**Perbaikan vs notebook RapidOCR:** field nama yang sebelumnya rusak
-(`PT. INTISOLUSINDO GABADI`, `PT.JINTI SOLUSINDOABADI`) sekarang benar
-(`PT. INTI SOLUSINDO ABADI`, `PT. Surya Multi Cemerlang`,
-`PT. Platinum Ceramics Industry`).
-
-**Masalah yang masih diketahui:**
-1. Teks yang hanya ada di **logo/resolusi rendah** bisa kehilangan spasi/titik
-   (DO supplier `PT.INTI SOLUSINDO ABADI` tanpa spasi setelah "PT.",
-   FP supplier `PRIMEDIA ARMOEKADATA INTERNET`). Sudah jauh membaik lewat
-   **OCR pas kedua area header** (`run_header`), nilai asli ada di
-   `ocr.header_text`.
-2. NPWP diambil dari baris OCR berlabel `NPWP:` (lebih andal), tapi belum
-   dinormalisasi ke format 15-digit.
-3. **RAM**: batch 8 dokumen dalam satu proses peak ±5.5GB; jika mesin sedang
-   dipakai proses lain (RAM tersedia < 6GB), batch bisa kena OOM-kill — jalankan
-   per-grup bila perlu.
-4. `kwitansi_number` di Kuitansi bisa terbaca `V1` vs `VV` (huruf I/V kecil).
-
-**Perbaikan yang sudah diterapkan (revisi):**
-- `po_number`/`po_date` (No. & Tanggal PO/SPK) ditambah di schema invoice & DO.
-- Prioritas instruksi: OCR = sumber nilai persis, gambar = cadangan.
-- Koreksi field kode/nomor dari OCR ber-conf tinggi (`correct_codes_from_ocr`),
-  termasuk NPWP dari baris `NPWP:`.
-- OCR pas kedua area header (`run_header`): crop 22% atas + upscale 2x untuk
-  membaca nama perusahaan di dalam logo (mis. `PT.INTI SOLUSINDO ABADI`).
-- `due_date==po_date` yang duplikat dibuang; `kwitansi_number` hanya diisi jika
-  ada nomor kwitansi tersendiri; `invoice_date` = tanggal terbit (bukan Due Date).
-
----
-
-## 8. Integrasi VLM (GLM-4.6V-Flash) — Tulisan Tangan & Coretan
-
-> **Model:** `zai-org/glm-4.6v-flash` (GLM-4.6V-Flash, Z.AI/Zhipu) via **API lokal**
-> `http://10.0.1.250:1234/v1` (OpenAI-compatible, client `openai`). Model TIDAK
-> dimuat lokal — cukup HTTP. Config: blok `VLM_API_*` di `config.py` (env
-> `VLM_API_BASE_URL`/`VLM_API_KEY`/`VLM_API_MODEL`).
-
-**Masalah yang dipecahkan:** PaddleOCR tidak bisa baca tulisan tangan dan salah
-memahami kata/angka yang **dicoret (ciretan)** dengan **pembetulan** di
-sebelahnya; NuExtract pada gambar ter-downscale bisa mengambil nilai yang dicoret
-sebagai hasil akhir.
-
-**Alur per dokumen (di `run_batch.process_one`):**
-
-```text
-PaddleOCR (teks cetak) + zone OCR (header/tabel)
-   -> A) heuristik tulisan tangan/coretan (selection/selector, GRATIS, 0 API)
-        |   bersih -> SKIP VLM -> langsung NuExtract (fast path, 0 call)
-        |   mencurigakan ->
-        v
-   -> B) VLM detect (YA/TIDAK, max_tokens 1024, reasoning ikut dihitung)
-        |   TIDAK -> SKIP
-        |   YA ->
-        v
-   -> C) VLM read -> corrections[] + handwritten_notes + cleaned_text
-        |   cleaned_text di-prepend "[KOREKSI]" ke teks OCR
-        v
-   NuExtract3-GGUF ekstrak JSON (instruksi: "pakai nilai pembetulan,
-   jangan yang dicoret" dari extraction/schemas.py)
-        |
-   -> D) VLM review field: override field memakai nilai pembetulan
-        |   nilai asli disimpan di result["vlm"]["review_changes"] (audit)
-        v
-   normalise -> validate -> results/
-```
-
-Hasil VLM dicatat di `result["vlm"]` (enabled/used/detected/skip_reason/error/
-corrections/handwritten_notes/review_changes/elapsed_seconds). Kegagalan API
-=> degrade halus: error tercatat, dokumen TETAP diproses (anti miss).
-
-**Temuan teknis (uji sintetis + doc nyata):**
-- Output GLM dibungkus `<|begin_of_box|>/<|end_of_box|>` dan model memakai
-  `reasoning_content` dulu (gateway lokal MENGABAIKAN `thinking.disabled`) —
-  `max_tokens` deteksi diperbesar (1024) + fallback parse dari reasoning.
-- Foto halaman padat (banyak teks) membuat reasoning panjang sehingga budget
-  token terpotong => `VLM_API_MAX_NEW_TOKENS=8192` (dokumentasi/pojok berisi
-  coretan butuh budget besar).
-- Heuristik dipakai 2 sinyal: confidence OCR **< 0.35** ATAU teks pendek dengan
-  rasio simbol tinggi. Tanda baca umum cetak `(Rp)`, `PPH (%)` diabaikan.
-  Semua 8 dokumen contoh = 0 baris mencurigakan => **0 panggilan API**.
-- Uji sintetis (nilai `116.550` dicoret + pembetulan `125.000`): detect=YA,
-  read menangkap `crossed_out=116.550, corrected=125.000`, review mengoreksi
-  field `total_amount`; NuExtract mengambil nilai pembetulan.
-- **Uji gambar asli (2 foto WhatsApp, test saja, bukan dokumen finance):**
-  detect=YA pada keduanya. Read berhasil membaca coretan + pembetulan:
-  gambar 1 -> `150 27001 : 2022`→`ISO/IEC 27001 ...`, `1EC`→`IEC`,
-  `pelathan`→`security`; gambar 2 -> `asuransi`→`supplier`. cleaned_text
-  memakai nilai pembetulan. (GLM terbukti jalan untuk tulisan tangan/coretan.)
-- **Prompt read diperbaiki (2 aturan interpretasi):** tulisan tangan bisa
-  PEMBETULAN (teks KETIK dicoret -> diganti tulisan tangan) ATAU TAMBAHAN kata
-  (insertion, tanpa coretan). Output JSON kini punya `corrections[]` +
-  `insertions[]` (struktur `{inserted, location}`). Test: insertion `security`
-  di poin 2.11 terbaca benar; `(segregation of duties)`/`(pelatihan security
-  awareness)` di gambar 1 terbaca benar.
-- **Perbandingan model (gambar asli, data nyata):**
-  - `qwen/qwen3-vl-30b` lebih akurat baca tulisan tangan: ejaan tepat
-    (`segregation of duties`, `pelatihan security awareness`, `pihak ketiga`)
-    dan lokasi poin benar.
-  - `glm-4.6v-flash` (flash) membaca isi tapi ejaan sering garbled
-    (`regregation`, `pelathan`, `pihak kelga`).
-  - Keduanya masih keliru pada atribusi kata yang dicoret tanda X/garis
-    (bukan nama kata yang salah dibaca, tapi arah coretan-vs-pembetulan).
-  - Ganti model cukup ubah env `VLM_API_MODEL` (config model-agnostic).
-- **Preprocessing membantu:** kirim gambar hasil `preprocess()` (bukan foto
-  mentah) memperbaiki keterbacaan tulisan tangan. Di pipeline produksi VLM
-  sudah menerima gambar ter-preprocess (`run_batch.prepare_image`).
-- Keterbatasan: font yang di-render tidak bisa "menipu" PaddleOCR (conf tetap
-  tinggi) — untuk pemicu penuh butuh tulisan tangan asli (sudah teruji pada
-  foto asli). Threshold di `selection/selector.py` mudah di-tuning.
-
----
-
-## 9. Roadmap
-
-- **Fase-2 (selesai):** UI Gradio langsung di `run_batch.py --ui` + `run.sh`.
-  - Upload banyak dokumen (ekstrak semua upload).
-  - Tombol "Ekstrak Semua Contoh" (proses semua dokumen di `contoh invoice/`).
-  - Model singleton: dimuat sekali, dipakai ulang antara klik (tanpa load ulang).
-  - UI hanya memakai `models.registry` (pola AI-Document/app.py).
-- **Fase-3 (selesai):**
-  - `po_number`/`po_date` (No. & Tanggal PO/SPK) di schema invoice & DO.
-  - OCR per-layout **PP-DocLayoutV3**: zona `table` dicrop + upscale; band
-    header/logo `run_header` (nama di dalam logo terbaca, mis. `PT.INTI
-    SOLUSINDO ABADI`). Model layout di-unload tiap dokumen (hemat RAM).
-  - Prioritas instruksi OCR sebagai sumber nilai persis + `correct_codes_from_ocr`
-    (kode/nomor + NPWP dari baris `NPWP:`).
-  - `due_date` duplikat (`==po_date`) dibuang; `kwitansi_number` kosong bila
-    tidak ada; `invoice_date` = tanggal terbit (bukan Due Date).
-  - Temuan: zona `header_image` berisi logo grafis tanpa teks; nama perusahaan
-    melewati batas zona `header_image`/`header` → pakai wide-band crop.
-- **Fase-4 (selesai):** integrasi VLM GLM-4.6V-Flash via API untuk tulisan
-  tangan/coretan (section 8). Model di `models/vlm_api_model.py`,
-  dipanggil selektif (heuristik -> detect -> read -> review).
-- **Fase-5 (opsional):** normalisasi NPWP 15 digit, penanganan spasi pada nama
-  dari logo (`PT.INTI` → `PT. INTI`), indikator progress di UI untuk batch
-  panjang, pengurangan RAM agar batch 8 dokumen bisa satu proses
-  (saat ini jalankan per-grup bila RAM tersedia < 6GB), verifikasi VLM dengan
-  dokumen asli ber-coretan (menunggu data dari user) + tuning threshold
-  heuristik.
+1. **A/B test NuExtract3 vs qwen2.5-coder-32b di slot structuring** — pakai sample hasil fusion yang sama, bandingkan output terutama di: normalisasi tanggal ambigu, normalisasi angka, dan kepatuhan mengisi `review_flags`.
+2. **Uji akurasi handwriting** — pakai dokumen dengan anotasi tangan (seperti contoh Kebijakan Keamanan Informasi yang dites sebelumnya) untuk memastikan qwen3-vl-30b dan glm-4.6v-flash konsisten menangkap anotasi tersebut.
+3. **Ukur frekuensi konflik qwen3-vl-30b vs glm-4.6v-flash** — dari sample dokumen riil, hitung berapa persen dokumen yang benar-benar butuh gemma4:31b sebagai tie-breaker. Kalau frekuensinya sangat rendah, ini mengonfirmasi keputusan on-demand sudah tepat secara cost.
+4. **Ukur latency end-to-end** — bandingkan waktu proses per dokumen antara arsitektur ini dengan versi sebelumnya (qwen2.5-coder-32b di slot structuring) untuk memastikan penghematan compute benar-benar terasa.
