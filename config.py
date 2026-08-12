@@ -1,11 +1,13 @@
 """
 config.py
-=========
-Konfigurasi terpusat untuk nu-paddle (NuExtract3-GGUF main + PaddleOCR support).
+==========
+Konfigurasi terpusat untuk nu-paddle (NuExtract3-GGUF main + PaddleOCR support
++ VLM API GLM-4.6V-Flash untuk tulisan tangan/coretan).
 """
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -39,6 +41,26 @@ PADDLEOCR_PARAMS = {
 
 # Baris OCR dengan confidence di bawah ini dibuang (tidak dikirim ke NuExtract).
 OCR_CONFIDENCE_THRESHOLD = 0.6
+
+# ---------------------------------------------------------------------------
+# VLM API — GLM-4.6V-Flash (Z.AI) via API lokal OpenAI-compatible.
+# Dipakai SELEKTIF untuk tulisan tangan / coretan (ciretan) & pembetulan di
+# sebelahnya. Model TIDAK dimuat lokal — cukup HTTP client.
+# ---------------------------------------------------------------------------
+VLM_API_ENABLED = True
+# Base URL gateway lokal (OpenAI-compatible). Override via env var.
+VLM_API_BASE_URL = os.environ.get("VLM_API_BASE_URL", "http://10.0.1.250:1234/v1")
+VLM_API_KEY = os.environ.get("VLM_API_KEY", "lm-studio")
+VLM_API_MODEL = os.environ.get("VLM_API_MODEL", "zai-org/glm-4.6v-flash")
+VLM_API_TIMEOUT = int(os.environ.get("VLM_API_TIMEOUT", "180"))
+
+# Sisi terpanjang maksimal gambar yang dikirim (fit penuh halaman).
+VLM_API_MAX_SIDE = 1600
+VLM_API_JPEG_QUALITY = 92
+VLM_API_MAX_NEW_TOKENS = 4096
+VLM_API_TEMPERATURE = 0.0
+# Nonaktifkan chain-of-thought GLM (lebih cepat & deterministik).
+VLM_API_DISABLE_THINKING = True
 
 # ---------------------------------------------------------------------------
 # LAYOUT ANALYSIS — PP-DocLayoutV3 (deteksi zona, offline)

@@ -21,3 +21,6 @@ tqdm>=4.66.0
 
 # --- UI Gradio (fase-2) ---
 gradio>=6.0.0
+
+# --- VLM API GLM-4.6V-Flash (tulisan tangan/coretan, via API OpenAI-compatible) ---
+openai>=1.0.0

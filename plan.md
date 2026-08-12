@@ -207,7 +207,63 @@ Waktu rata-rata ± 87 detik/dokumen (CPU; PaddleOCR ~15-17s + NuExtract ~45-70s)
 
 ---
 
-## 8. Roadmap
+## 8. Integrasi VLM (GLM-4.6V-Flash) — Tulisan Tangan & Coretan
+
+> **Model:** `zai-org/glm-4.6v-flash` (GLM-4.6V-Flash, Z.AI/Zhipu) via **API lokal**
+> `http://10.0.1.250:1234/v1` (OpenAI-compatible, client `openai`). Model TIDAK
+> dimuat lokal — cukup HTTP. Config: blok `VLM_API_*` di `config.py` (env
+> `VLM_API_BASE_URL`/`VLM_API_KEY`/`VLM_API_MODEL`).
+
+**Masalah yang dipecahkan:** PaddleOCR tidak bisa baca tulisan tangan dan salah
+memahami kata/angka yang **dicoret (ciretan)** dengan **pembetulan** di
+sebelahnya; NuExtract pada gambar ter-downscale bisa mengambil nilai yang dicoret
+sebagai hasil akhir.
+
+**Alur per dokumen (di `run_batch.process_one`):**
+
+```text
+PaddleOCR (teks cetak) + zone OCR (header/tabel)
+   -> A) heuristik tulisan tangan/coretan (selection/selector, GRATIS, 0 API)
+        |   bersih -> SKIP VLM -> langsung NuExtract (fast path, 0 call)
+        |   mencurigakan ->
+        v
+   -> B) VLM detect (YA/TIDAK, max_tokens 1024, reasoning ikut dihitung)
+        |   TIDAK -> SKIP
+        |   YA ->
+        v
+   -> C) VLM read -> corrections[] + handwritten_notes + cleaned_text
+        |   cleaned_text di-prepend "[KOREKSI]" ke teks OCR
+        v
+   NuExtract3-GGUF ekstrak JSON (instruksi: "pakai nilai pembetulan,
+   jangan yang dicoret" dari extraction/schemas.py)
+        |
+   -> D) VLM review field: override field memakai nilai pembetulan
+        |   nilai asli disimpan di result["vlm"]["review_changes"] (audit)
+        v
+   normalise -> validate -> results/
+```
+
+Hasil VLM dicatat di `result["vlm"]` (enabled/used/detected/skip_reason/error/
+corrections/handwritten_notes/review_changes/elapsed_seconds). Kegagalan API
+=> degrade halus: error tercatat, dokumen TETAP diproses (anti miss).
+
+**Temuan teknis (uji sintetis + doc nyata):**
+- Output GLM dibungkus `<|begin_of_box|>/<|end_of_box|>` dan model memakai
+  `reasoning_content` dulu (gateway lokal MENGABAIKAN `thinking.disabled`) —
+  `max_tokens` deteksi diperbesar (1024) + fallback parse dari reasoning.
+- Heuristik dipakai 2 sinyal: confidence OCR **< 0.35** ATAU teks pendek dengan
+  rasio simbol tinggi. Tanda baca umum cetak `(Rp)`, `PPH (%)` diabaikan.
+  Semua 8 dokumen contoh = 0 baris mencurigakan => **0 panggilan API**.
+- Uji sintetis (nilai `116.550` dicoret + pembetulan `125.000`): detect=YA,
+  read menangkap `crossed_out=116.550, corrected=125.000`, review mengoreksi
+  field `total_amount`; NuExtract mengambil nilai pembetulan.
+- Keterbatasan: font yang di-render tidak bisa "menipu" PaddleOCR (conf tetap
+  tinggi) — verifikasi menyeluruh butuh dokumen asli ber-coretan (menunggu dari
+  user). Threshold di `selection/selector.py` mudah di-tuning.
+
+---
+
+## 9. Roadmap
 
 - **Fase-2 (selesai):** UI Gradio langsung di `run_batch.py --ui` + `run.sh`.
   - Upload banyak dokumen (ekstrak semua upload).
@@ -225,7 +281,12 @@ Waktu rata-rata ± 87 detik/dokumen (CPU; PaddleOCR ~15-17s + NuExtract ~45-70s)
     tidak ada; `invoice_date` = tanggal terbit (bukan Due Date).
   - Temuan: zona `header_image` berisi logo grafis tanpa teks; nama perusahaan
     melewati batas zona `header_image`/`header` → pakai wide-band crop.
-- **Fase-4 (opsional):** normalisasi NPWP 15 digit, penanganan spasi pada nama
+- **Fase-4 (selesai):** integrasi VLM GLM-4.6V-Flash via API untuk tulisan
+  tangan/coretan (section 8). Model di `models/vlm_api_model.py`,
+  dipanggil selektif (heuristik -> detect -> read -> review).
+- **Fase-5 (opsional):** normalisasi NPWP 15 digit, penanganan spasi pada nama
   dari logo (`PT.INTI` → `PT. INTI`), indikator progress di UI untuk batch
   panjang, pengurangan RAM agar batch 8 dokumen bisa satu proses
-  (saat ini jalankan per-grup bila RAM tersedia < 6GB).
+  (saat ini jalankan per-grup bila RAM tersedia < 6GB), verifikasi VLM dengan
+  dokumen asli ber-coretan (menunggu data dari user) + tuning threshold
+  heuristik.

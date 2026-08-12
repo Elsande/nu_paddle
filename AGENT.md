@@ -2,7 +2,8 @@
 
 Project gabungan **doc-validation + paddleocr** dengan preprocessing dari
 **AI-Document**. Arsitektur: NuExtract3-GGUF (model utama, JSON terstruktur)
-dibantu PaddleOCR (support, sumber teks + confidence).
+dibantu PaddleOCR (support, sumber teks + confidence) dan **GLM-4.6V-Flash via
+API** (support, tulisan tangan/coretan — dipanggil selektif).
 
 ## Struktur & Aturan Wajib
 
@@ -22,6 +23,14 @@ dibantu PaddleOCR (support, sumber teks + confidence).
    `run_region()`/`run_header()` untuk OCR per-wilayah).
    **Layout**: `models/layout_model.py` (PP-DocLayoutV3, deteksi zona
    `header_image`/`header`/`table`; model lokal offline).
+   **VLM API**: `models/vlm_api_model.py` (GLM-4.6V-Flash via API lokal
+   OpenAI-compatible `http://10.0.1.250:1234/v1`; model TIDAK dimuat lokal).
+   Tugasnya: baca tulisan tangan, pahami coretan (ciretan) + pembetulan di
+   sebelahnya. Dipanggil SELEKTIF oleh `run_batch.process_one`:
+   heuristik (`selection/selector.detect_handwriting_heuristic`) -> detect
+   YA/TIDAK -> read (corrections + cleaned_text digabung ke OCR text) ->
+   review field JSON (nilai pembetulan menang, nilai asli dicatat di
+   `result["vlm"]["review_changes"]`).
 5. **PENTING (jangan diubah tanpa alasan teknis)**:
    - Gambar WAJIB melewati `fit_image_for_vision` (<= 900k px) sebelum dikirim
      ke NuExtract — CLIP/mmproj llama.cpp segfault di atas ~1 MP.
@@ -46,7 +55,12 @@ dibantu PaddleOCR (support, sumber teks + confidence).
      menjaga peak RAM tetap di bawah batas saat NuExtract dimuat. Jangan
      mengubahnya menjadi persistent singleton.
 6. **Tidak ada file lain yang boleh diubah saat menambah model** selain
-   `models/` + `models/registry.py`.
+   `models/` + `models/registry.py`. PENGECUALIAN yang SAH (integrasi VLM
+   tulisan tangan/coretan): `config.py` (blok `VLM_API_*`),
+   `run_batch.py` (`process_one` + singleton `get_vlm_model` + `result["vlm"]`),
+   `extraction/schemas.py` (instruksi nilai pembetulan), dan
+   `selection/selector.py` (`detect_handwriting_heuristic`). Jangan menambah
+   file lain tanpa alasan teknis.
 
 ## Perintah Verifikasi
 

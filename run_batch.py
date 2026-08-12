@@ -38,7 +38,7 @@ from models.registry import AVAILABLE_MODELS
 from preprocessing.pipeline import preprocess
 from preprocessing.pdf_to_image import pdf_to_image
 from preprocessing.pillow_utils import save_array_as_image
-from selection.selector import evaluate
+from selection.selector import detect_handwriting_heuristic, evaluate
 from validation import correct_codes_from_ocr, normalise_fields, validate_document
 
 SUPPORTED_EXTS = config.SUPPORTED_IMAGE_EXTS | {".pdf"}
@@ -51,6 +51,7 @@ SUPPORTED_EXTS = config.SUPPORTED_IMAGE_EXTS | {".pdf"}
 _OCR: object | None = None
 _EXTRACTOR: object | None = None
 _LAYOUT: object | None = None
+_VLM: object | None = None
 
 
 def get_ocr_model():
@@ -78,6 +79,15 @@ def get_layout_model():
         _LAYOUT = LayoutModel()
         _LAYOUT.load()
     return _LAYOUT
+
+
+def get_vlm_model():
+    """VLMApiModel (GLM-4.6V-Flash via API) singleton — ringan, tanpa RAM besar."""
+    global _VLM
+    if _VLM is None:
+        _VLM = AVAILABLE_MODELS["GLM-4.6V-Flash (API)"]()
+        _VLM.load()
+    return _VLM
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +254,18 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
             "error": prep_meta.get("reject_reason") or "Gagal menyiapkan gambar",
             "validation": {"status": "FAILED", "field_errors": [], "rules": []},
             "ocr": {"included": False, "reason": "no image", "stats": {}},
+            "vlm": {
+                "enabled": config.VLM_API_ENABLED,
+                "used": False,
+                "detected": False,
+                "skip_reason": "no image",
+                "error": None,
+                "suspicious_lines_count": 0,
+                "corrections": [],
+                "handwritten_notes": [],
+                "review_changes": [],
+                "elapsed_seconds": 0.0,
+            },
         }
 
     # 1) PaddleOCR (support) — halaman penuh.
@@ -272,6 +294,54 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
     )
     ocr_text = decision.filtered_text if decision.include_text else ""
 
+    # 1c) VLM API (GLM-4.6V-Flash) — SELEKTIF untuk tulisan tangan/coretan.
+    # A) Heuristik murah (tanpa API) -> B) detect YA/TIDAK -> C) read koreksi.
+    vlm_meta = {
+        "enabled": config.VLM_API_ENABLED,
+        "used": False,
+        "detected": False,
+        "skip_reason": "",
+        "error": None,
+        "suspicious_lines_count": 0,
+        "corrections": [],
+        "handwritten_notes": [],
+        "review_changes": [],
+        "elapsed_seconds": 0.0,
+    }
+    vlm_used = False
+    if config.VLM_API_ENABLED:
+        suspicious = detect_handwriting_heuristic(combined_lines)
+        vlm_meta["suspicious_lines_count"] = len(suspicious)
+        if not suspicious:
+            vlm_meta["skip_reason"] = "heuristik: tidak ada indikasi tulisan tangan/coretan"
+        else:
+            vlm = get_vlm_model()
+            det = vlm.detect_handwriting(image_path)
+            vlm_meta["elapsed_seconds"] += det.elapsed_seconds
+            if det.error:
+                vlm_meta["error"] = f"detect: {det.error}"
+                vlm_meta["skip_reason"] = "deteksi VLM gagal (degrade halus)"
+            elif (det.extra or {}).get("detected"):
+                vlm_meta["detected"] = True
+                vlm_meta["used"] = True
+                vlm_used = True
+                read_res = vlm.read_handwriting(image_path)
+                vlm_meta["elapsed_seconds"] += read_res.elapsed_seconds
+                if read_res.error:
+                    vlm_meta["error"] = f"read: {read_res.error}"
+                else:
+                    rextra = read_res.extra or {}
+                    vlm_meta["corrections"] = rextra.get("corrections") or []
+                    vlm_meta["handwritten_notes"] = rextra.get("handwritten_notes") or []
+                    cleaned = (rextra.get("cleaned_text") or "").strip()
+                    # Teks bersih (nilai dicoret DIGANTI pembetulan) ikut ke NuExtract.
+                    if cleaned:
+                        ocr_text = (ocr_text.strip() + "\n" if ocr_text.strip() else "") + f"[KOREKSI]\n{cleaned}"
+            else:
+                vlm_meta["skip_reason"] = "VLM: tidak ada tulisan tangan/coretan"
+    else:
+        vlm_meta["skip_reason"] = "VLM API dinonaktifkan"
+
     # 2) NuExtract3-GGUF (main)
     # OCR/layout sudah tidak dibutuhkan di fase ini: unload + gc dulu supaya
     # peak RAM saat NuExtract dimuat/dijalankan tetap di bawah batas.
@@ -286,6 +356,32 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
     # 3) Koreksi field kode/nomor dari OCR (PaddleOCR lebih akurat untuk kode).
     all_lines = list(ocr_extra.get("all_lines") or []) + list(zone_all_lines)
     fields = correct_codes_from_ocr(fields, all_lines)
+
+    # 3b) VLM REVIEW: koreksi field memakai nilai pembetulan (audit nilai asli).
+    if vlm_used and not vlm_meta.get("error"):
+        vlm = get_vlm_model()
+        rev = vlm.review_fields(image_path, fields, doc_type=doc_type, ocr_text=ocr_text)
+        vlm_meta["elapsed_seconds"] += rev.elapsed_seconds
+        if rev.error:
+            vlm_meta["error"] = f"review: {rev.error}"
+        else:
+            applied: list[dict] = []
+            for ch in (rev.extra or {}).get("changes") or []:
+                field = ch.get("field")
+                new_val = ch.get("new_value")
+                if not field or field not in fields or fields[field] == new_val:
+                    continue
+                applied.append(
+                    {
+                        "field": field,
+                        "old_value": fields[field],
+                        "new_value": new_val,
+                        "reason": ch.get("reason", ""),
+                    }
+                )
+                fields[field] = new_val
+            vlm_meta["review_changes"] = applied
+
     normalised = normalise_fields(fields)
     validation = validate_document(doc_type, normalised)
     elapsed_ms = round((time.time() - t_start) * 1000, 2)
@@ -319,6 +415,7 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
             "header_lines": header_meta.get("lines", []),
             "header_text": header_meta.get("text", ""),
         },
+        "vlm": vlm_meta,
         "error": ext.error,
     }
 

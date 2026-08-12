@@ -177,4 +177,9 @@ def build_instructions(doc_type: str, lang: str = "id") -> str:
         "gunakan nilai dari teks OCR bila tersedia; gambar dokumen hanya dipakai "
         "untuk memastikan layout bila teks OCR tidak jelas."
     )
+    lines.append(
+        "Bila ada kata/angka yang DICORET (ciretan/coretan/garis coret) dan ada "
+        "PEMBETULAN di sebelahnya, gunakan nilai PEMBETULAN, jangan nilai yang "
+        "dicoret."
+    )
     return " ".join(lines)
