@@ -1,24 +1,19 @@
-"""VLM API — GLM-4.6V-Flash (Z.AI) untuk tulisan tangan / coretan.
+"""VLM API — paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash (SATU gateway).
 
-Model VLM dipanggil LEWAT API OpenAI-compatible (gateway lokal perusahaan),
-bukan dimuat ke mesin ini — cukup HTTP client ringan. Tugas utamanya
-(role="support") menangani apa yang tidak bisa PaddleOCR:
+Ketiga model dipanggil LEWAT API OpenAI-compatible yang SAMA (gateway lokal
+perusahaan, ``config.VLM_API_BASE_URL``) — yang membedakan hanya nama model.
+Model TIDAK dimuat ke mesin ini; cukup HTTP client ringan.
 
-1. Membaca TULISAN TANGAN (handwriting) di atas nilai cetak.
-2. Memahami CORETAN (ciretan/cross-out): mana kata/angka yang dicoret dan mana
-   PEMBETULAN yang ditulis di sebelahnya -> hasil akhir memakai nilai pembetulan.
+Kelas:
+- ``OpenAIVLModel`` : base generik untuk semua model VLM OpenAI-compatible.
+  Punya ``_chat()`` (gambar + prompt) + ``extract_document()`` (ekstraksi
+  JSON terstruktur sesuai schema per jenis dokumen) + langkah tulisan
+  tangan/coretan (detect/read/review).
+- ``VLMApiModel``  : GLM-4.6V-Flash (nama model dari ``config.GLM_VL_MODEL``).
+- ``Qwen3VLModel`` : Qwen3-VL-30B (nama model dari ``config.QWEN3_VL_MODEL``).
 
-Dipanggil SELEKTIF oleh ``run_batch`` hanya bila heuristik
-(``selection.selector.detect_handwriting_heuristic``) menandai dokumen
-mencurigakan, lalu dibagi jadi 3 langkah:
-
-- ``detect_handwriting`` : konfirmasi YA/TIDAK (biaya murah, max_tokens kecil).
-- ``read_handwriting``   : daftar koreksi + catatan tulisan tangan + teks bersih.
-- ``review_fields``      : koreksi field JSON hasil NuExtract memakai nilai
-  pembetulan (nilai asli tetap disimpan utk audit trail).
-
-Kegagalan API tidak boleh menggagalkan dokumen: cukup di-catch dan dicatat di
-``result["vlm"]["error"]`` (degrade halus, anti miss).
+Kegagalan API tidak boleh menggagalkan dokumen: cukup di-catch dan dicatat
+(degrade halus, anti miss).
 """
 
 from __future__ import annotations
@@ -32,23 +27,54 @@ import time
 from typing import Any, Optional
 
 from config import (
+    GLM_VL_MODEL,
+    QWEN3_VL_MODEL,
     VLM_API_BASE_URL,
     VLM_API_DISABLE_THINKING,
     VLM_API_JPEG_QUALITY,
     VLM_API_KEY,
     VLM_API_MAX_NEW_TOKENS,
     VLM_API_MAX_SIDE,
-    VLM_API_MODEL,
     VLM_API_READ_MAX_SIDE,
     VLM_API_TEMPERATURE,
     VLM_API_TIMEOUT,
 )
+from extraction.schemas import build_schema, build_instructions
 from models.base import BaseExtractionModel, ModelResult
 from models.nuextract_gguf_model import extract_json
 
 
 # ---------------------------------------------------------------------------
-# PROMPT (Bahasa Indonesia, fokus tulisan tangan + coretan)
+# PROMPT EKSTRAKSI TERSTRUKTUR (dipakai qwen3-vl & glm — SAMA PERSIS)
+# ---------------------------------------------------------------------------
+EXTRACT_SYSTEM_PROMPT = (
+    "Kamu adalah sistem ekstraksi dokumen bisnis Indonesia. Tugasmu HANYA "
+    "membaca dan mengekstrak informasi yang benar-benar terlihat di gambar. "
+    "Jangan menebak, menghitung, atau melengkapi data yang tidak tertulis. "
+    "Jika ada tulisan tangan (handwriting), coretan, atau catatan tambahan, "
+    "ekstrak TERPISAH ke 'anotasi_tulisan_tangan'. Jika ada teks yang dicoret "
+    "dan diperbaiki dengan tulisan tangan, gunakan nilai PEMBETULAN. Jika suatu "
+    "field tidak terbaca atau tidak ada, isi null. Jangan menerjemahkan istilah "
+    "Indonesia. Output HARUS berupa JSON valid saja — tidak ada teks pembuka, "
+    "penutup, atau penjelasan di luar JSON."
+)
+
+EXTRACT_USER_PROMPT = (
+    "Berikut gambar dokumen bisnis jenis '{doc_type}'. Ekstrak seluruh informasi "
+    "yang terlihat sesuai template JSON di bawah ini (JANGAN mengubah nama key):\n\n"
+    "{schema}\n\n"
+    "Kembalikan HANYA JSON valid dengan format:\n"
+    '{{"<nama_field>": {{"value": <nilai atau null>, "confidence": 0.0-1.0}}, '
+    '"...": "...", "line_items": [objek biasa tanpa value/confidence], '
+    '"anotasi_tulisan_tangan": [{{"teks": string, "lokasi_referensi": string, '
+    '"jenis": "koreksi|catatan_tambahan|paraf|tidak_diketahui", "confidence": 0.0}}]}}\n'
+    "- Untuk tiap field template, isi objek {\"value\", \"confidence\"}.\n"
+    "- line_items (jika ada di template) diisi array objek polos.\n"
+    "- anotasi_tulisan_tangan: daftar tulisan tangan/coretan (kosong bila tidak ada)."
+)
+
+# ---------------------------------------------------------------------------
+# PROMPT TULISAN TANGAN / CORETAN (dipakai GLM — selektif)
 # ---------------------------------------------------------------------------
 DETECT_PROMPT = (
     "Periksa dokumen gambar ini dengan teliti. Apakah ada (1) tulisan tangan, "
@@ -99,33 +125,33 @@ REVIEW_PROMPT = (
 )
 
 
-class VLMApiModel(BaseExtractionModel):
-    """GLM-4.6V-Flash via API OpenAI-compatible (tulisan tangan/coretan)."""
+class OpenAIVLModel(BaseExtractionModel):
+    """Base generik: model VLM yang dipanggil via API OpenAI-compatible.
 
-    name = "GLM-4.6V-Flash (API)"
+    Semua model (paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash) memakai
+    gateway yang sama; subclass hanya mengganti nama model + nama tampilan.
+    """
+
+    name = "OpenAI VLM API"
     role = "support"
+    _default_model: str = ""
 
-    # max_tokens khusus untuk deteksi YA/TIDAK (GLM memakai reasoning dulu).
+    # max_tokens khusus untuk deteksi YA/TIDAK (model memakai reasoning dulu).
     _DETECT_MAX_NEW_TOKENS = 1024
-
-    @staticmethod
-    def _strip_box_tags(text: str) -> str:
-        """Buang penanda <|begin_of_box|> / <|end_of_box|> dari output model."""
-        return re.sub(r"<\|(?:begin|end)_of_box\|>", "", text).strip()
 
     def __init__(
         self,
+        model: str | None = None,
         base_url: str = VLM_API_BASE_URL,
         api_key: str = VLM_API_KEY,
-        model: str = VLM_API_MODEL,
         timeout: int = VLM_API_TIMEOUT,
         max_new_tokens: int = VLM_API_MAX_NEW_TOKENS,
         temperature: float = VLM_API_TEMPERATURE,
         disable_thinking: bool = VLM_API_DISABLE_THINKING,
     ) -> None:
+        self._model = model or self._default_model
         self._base_url = base_url
         self._api_key = api_key
-        self._model = model
         self._timeout = timeout
         self._max_new_tokens = max_new_tokens
         self._temperature = temperature
@@ -152,6 +178,11 @@ class VLMApiModel(BaseExtractionModel):
         gc.collect()
 
     # -- util gambar -------------------------------------------------------
+    @staticmethod
+    def _strip_box_tags(text: str) -> str:
+        """Buang penanda <|begin_of_box|> / <|end_of_box|> dari output model."""
+        return re.sub(r"<\|(?:begin|end)_of_box\|>", "", text).strip()
+
     def _encode_image(self, image_path: str, max_side: int = VLM_API_MAX_SIDE) -> str:
         """Encode gambar jadi data URI JPEG (fit sisi <= max_side)."""
         from PIL import Image
@@ -175,6 +206,7 @@ class VLMApiModel(BaseExtractionModel):
         text_prompt: str,
         max_new_tokens: int | None = None,
         max_side: int = VLM_API_MAX_SIDE,
+        system_prompt: str | None = None,
     ) -> str:
         """Satu panggilan chat completion dengan gambar + prompt. Return teks."""
         self.load()
@@ -182,15 +214,15 @@ class VLMApiModel(BaseExtractionModel):
             raise RuntimeError("Client VLM API tidak tersedia (panggil load() dulu).")
 
         image_url = self._encode_image(image_path, max_side=max_side)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                    {"type": "text", "text": text_prompt},
-                ],
-            }
+        user_content: list[dict[str, Any]] = [
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text", "text": text_prompt},
         ]
+        messages: list[dict[str, Any]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_content})
+
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
@@ -199,8 +231,8 @@ class VLMApiModel(BaseExtractionModel):
         if self._temperature is not None:
             kwargs["temperature"] = self._temperature
 
-        # Coba dengan param GLM tambahan; bila gateway menolak (400), ulangi
-        # tanpa param tambahan (temperature tetap dipertahankan bila aman).
+        # Coba dengan param tambahan (thinking disabled); bila gateway menolak
+        # (400), ulangi tanpa param tambahan (temperature tetap dipertahankan).
         for attempt in (0, 1):
             if attempt == 0 and self._disable_thinking:
                 kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
@@ -209,7 +241,7 @@ class VLMApiModel(BaseExtractionModel):
             try:
                 completion = self._client.chat.completions.create(**kwargs)
                 message = completion.choices[0].message
-                # GLM lokal bisa mengembalikan jawaban di reasoning_content
+                # Model lokal bisa mengembalikan jawaban di reasoning_content
                 # dengan content kosong (terpotong). Fallback ke reasoning.
                 content = (message.content or "").strip()
                 if not content:
@@ -222,7 +254,7 @@ class VLMApiModel(BaseExtractionModel):
         return ""  # pragma: no cover (loop di atas selalu raise di attempt terakhir)
 
     def run(self, image_path: str, **kwargs) -> ModelResult:
-        """Kontrak wajib: ekstraksi teks umum dari gambar (jarang dipakai langsung)."""
+        """Kontrak wajib: teks umum dari gambar (jarang dipakai langsung)."""
         t0 = time.time()
         try:
             text = self._chat(image_path, READ_PROMPT)
@@ -230,7 +262,66 @@ class VLMApiModel(BaseExtractionModel):
         except Exception as exc:  # noqa: BLE001
             return ModelResult("", self.name, time.time() - t0, error=str(exc))
 
-    # -- langkah tulisan tangan / coretan ---------------------------------
+    # -- ekstraksi terstruktur (qwen3-vl & glm) ----------------------------
+    def extract_document(
+        self,
+        image_path: str,
+        doc_type: str = "invoice",
+        ocr_text: str = "",
+        max_side: int = VLM_API_MAX_SIDE,
+    ) -> ModelResult:
+        """Ekstrak field JSON terstruktur dari *image_path*.
+
+        Output ModelResult.fields = {field: value}. extra["confidences"] =
+        {field: 0.0-1.0 | None}, extra["handwritten_notes"], extra["doc_type"].
+        """
+        t0 = time.time()
+        try:
+            schema = build_schema(doc_type)
+            instructions = build_instructions(doc_type, lang="id")
+            prompt = EXTRACT_USER_PROMPT.format(doc_type=doc_type, schema=schema)
+            if instructions:
+                prompt += f"\n\nPetunjuk lapangan:\n{instructions}"
+            if ocr_text:
+                prompt += f"\n\nTeks OCR pendukung (konteks saja):\n{ocr_text[:4000]}"
+
+            text = self._chat(
+                image_path,
+                prompt,
+                max_side=max_side,
+                system_prompt=EXTRACT_SYSTEM_PROMPT,
+            )
+            data = extract_json(text)
+            if not isinstance(data, dict):
+                raise ValueError("Output ekstraksi bukan objek JSON.")
+
+            fields: dict[str, Any] = {}
+            confidences: dict[str, float | None] = {}
+            for key, value in data.items():
+                if key == "anotasi_tulisan_tangan":
+                    continue
+                if isinstance(value, dict) and "value" in value:
+                    conf = value.get("confidence")
+                    confidences[key] = float(conf) if isinstance(conf, (int, float)) else None
+                    fields[key] = value.get("value")
+                else:
+                    fields[key] = value
+
+            return ModelResult(
+                text,
+                self.name,
+                time.time() - t0,
+                fields=fields,
+                extra={
+                    "confidences": confidences,
+                    "handwritten_notes": data.get("anotasi_tulisan_tangan") or [],
+                    "doc_type": doc_type,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ModelResult("", self.name, time.time() - t0, error=str(exc))
+
+    # -- langkah tulisan tangan / coretan (selektif) -----------------------
     def detect_handwriting(self, image_path: str) -> ModelResult:
         """Konfirmasi YA/TIDAK ada tulisan tangan/coretan. extra["detected"]."""
         t0 = time.time()
@@ -279,7 +370,7 @@ class VLMApiModel(BaseExtractionModel):
         doc_type: str = "invoice",
         ocr_text: str = "",
     ) -> ModelResult:
-        """Koreksi field JSON hasil NuExtract. extra["changes"] (list dict)."""
+        """Koreksi field JSON hasil fusion. extra["changes"] (list dict)."""
         t0 = time.time()
         try:
             prompt = REVIEW_PROMPT.format(
@@ -302,3 +393,19 @@ class VLMApiModel(BaseExtractionModel):
             )
         except Exception as exc:  # noqa: BLE001
             return ModelResult("", self.name, time.time() - t0, error=str(exc))
+
+
+class VLMApiModel(OpenAIVLModel):
+    """GLM-4.6V-Flash via API OpenAI-compatible (tulisan tangan/coretan)."""
+
+    name = "GLM-4.6V-Flash (API)"
+    role = "support"
+    _default_model = GLM_VL_MODEL
+
+
+class Qwen3VLModel(OpenAIVLModel):
+    """Qwen3-VL-30B via API OpenAI-compatible (ekstraksi + tulisan tangan)."""
+
+    name = "Qwen3-VL-30B (API)"
+    role = "support"
+    _default_model = QWEN3_VL_MODEL

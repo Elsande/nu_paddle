@@ -1,12 +1,15 @@
 # requirements.txt
 # =================
-# Dependensi untuk nu-paddle (NuExtract3-GGUF main + PaddleOCR support).
-# Fase-1: batch extraction via run_batch.py.
+# Dependensi untuk nu-paddle.
+# Arsitektur baru: paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash semuanya
+# dipanggil LEWAT API OpenAI-compatible (gateway lokal) — bukan dimuat lokal.
+# NuExtract3-GGUF (lokal) sementara OFF (config.NUEXTRACT_ENABLED=False).
 
-# --- NuExtract3-GGUF via llama.cpp (model utama) ---
+# --- NuExtract3-GGUF via llama.cpp (lokal, SEMENTARA OFF) ---
 llama-cpp-python==0.3.34
 
-# --- PaddleOCR support (OCR pendukung / sumber teks) ---
+# --- PaddleOCR (dipakai untuk LayoutDetection/PP-DocLayoutV3 saja; OCR utama
+#     sudah lewat API paddleocr-vl 1.6) ---
 paddlepaddle>=3.3.1
 paddleocr>=3.4.0,<4.0.0
 
@@ -22,5 +25,6 @@ tqdm>=4.66.0
 # --- UI Gradio (fase-2) ---
 gradio>=6.0.0
 
-# --- VLM API GLM-4.6V-Flash (tulisan tangan/coretan, via API OpenAI-compatible) ---
+# --- VLM API (paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash via gateway
+#     OpenAI-compatible yang sama) ---
 openai>=1.0.0

@@ -8,10 +8,12 @@ Pemakaian:
     python run_batch.py [file1 file2 ...]      # batch dokumen tertentu
     python run_batch.py --ui                   # buka UI Gradio (browser)
 
-Alur per dokumen:
-    preprocess (AI-Document) -> PaddleOCR (support) -> selector ->
-    NuExtract3-GGUF (main: gambar + ocr_text + schema) ->
-    normalisasi + validasi -> results/<jenis>_<nama>.json
+Alur per dokumen (arsitektur baru — semua lewat API OpenAI-compatible yang sama):
+    preprocess (AI-Document) -> paddleocr-vl 1.6 (OCR, via API) ->
+    qwen3-vl-30b + glm-4.6v-flash (ekstraksi, via API, paralel) ->
+    fusion layer (rule-based) -> normalisasi + validasi -> results/<jenis>_<nama>.json
+
+NuExtract3-GGUF (lokal) SEMENTARA OFF (config.NUEXTRACT_ENABLED=False).
 
 Model dimuat SEKALI (singleton) lalu dipakai ulang — untuk CLI maupun UI.
 """
@@ -26,6 +28,7 @@ import sys
 import tempfile
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Pastikan root proyek ada di sys.path (jalankan dari folder nu-paddle).
@@ -34,6 +37,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 import config
+from fusion import fuse_sources
 from models.registry import AVAILABLE_MODELS
 from preprocessing.pipeline import preprocess
 from preprocessing.pdf_to_image import pdf_to_image
@@ -47,23 +51,47 @@ SUPPORTED_EXTS = config.SUPPORTED_IMAGE_EXTS | {".pdf"}
 # ---------------------------------------------------------------------------
 # MODEL SINGLETON — dimuat SEKALI per proses, dipakai ulang (CLI & UI).
 # Hanya memakai models.registry (aturan AGENT.md: tanpa import class spesifik).
+# Semua model VLM ringan (HTTP client) — tidak ada beban RAM besar.
 # ---------------------------------------------------------------------------
 _OCR: object | None = None
+_QWEN3: object | None = None
+_GLM: object | None = None
 _EXTRACTOR: object | None = None
 _LAYOUT: object | None = None
-_VLM: object | None = None
 
 
 def get_ocr_model():
+    """paddleocr-vl 1.6 via API (pengganti PaddleOCR lokal)."""
     global _OCR
     if _OCR is None:
-        _OCR = AVAILABLE_MODELS["PaddleOCR"]()
+        _OCR = AVAILABLE_MODELS["PaddleOCR-VL 1.6 (API)"]()
         _OCR.load()
     return _OCR
 
 
+def get_qwen3_model():
+    """Qwen3-VL-30B via API."""
+    global _QWEN3
+    if _QWEN3 is None:
+        _QWEN3 = AVAILABLE_MODELS["Qwen3-VL-30B (API)"]()
+        _QWEN3.load()
+    return _QWEN3
+
+
+def get_glm_model():
+    """GLM-4.6V-Flash via API (ekstraksi + tulisan tangan/coretan)."""
+    global _GLM
+    if _GLM is None:
+        _GLM = AVAILABLE_MODELS["GLM-4.6V-Flash (API)"]()
+        _GLM.load()
+    return _GLM
+
+
 def get_extractor():
+    """NuExtract3-GGUF (lokal) — OFF sementara via config.NUEXTRACT_ENABLED."""
     global _EXTRACTOR
+    if not config.NUEXTRACT_ENABLED:
+        return None
     if _EXTRACTOR is None:
         _EXTRACTOR = AVAILABLE_MODELS["NuExtract3-GGUF"]()
         _EXTRACTOR.load()
@@ -79,15 +107,6 @@ def get_layout_model():
         _LAYOUT = LayoutModel()
         _LAYOUT.load()
     return _LAYOUT
-
-
-def get_vlm_model():
-    """VLMApiModel (GLM-4.6V-Flash via API) singleton — ringan, tanpa RAM besar."""
-    global _VLM
-    if _VLM is None:
-        _VLM = AVAILABLE_MODELS["GLM-4.6V-Flash (API)"]()
-        _VLM.load()
-    return _VLM
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +170,63 @@ def discover_documents(paths: list[str] | None = None) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# EKSTRAKSI PARALEL (qwen3-vl + glm)
+# ---------------------------------------------------------------------------
+def _extract_sources(image_path: str, doc_type: str, ocr_text: str, qwen3, glm) -> list[dict]:
+    """Jalankan ekstraksi qwen3-vl & glm (paralel bila keduanya ada).
+
+    Returns list[dict] dengan kunci ``name``, ``fields``, ``confidences``,
+    ``elapsed_seconds``, ``error`` (sumber yang gagal tetap dicatat, fields={}).
+    """
+    specs = [(m, name) for m, name in ((qwen3, "qwen3"), (glm, "glm")) if m is not None]
+    if not specs:
+        return []
+    entries: list[tuple[str, object | None]] = []
+
+    if len(specs) == 2:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futures = {
+                ex.submit(model.extract_document, image_path, doc_type=doc_type, ocr_text=ocr_text): name
+                for model, name in specs
+            }
+            for fut in as_completed(futures):
+                name = futures[fut]
+                try:
+                    entries.append((name, fut.result()))
+                except Exception as exc:  # noqa: BLE001
+                    entries.append((name, _failed_result(name, exc)))
+        entries.sort(key=lambda t: t[0])
+    else:
+        model, name = specs[0]
+        try:
+            entries.append((name, model.extract_document(image_path, doc_type=doc_type, ocr_text=ocr_text)))
+        except Exception as exc:  # noqa: BLE001
+            entries.append((name, _failed_result(name, exc)))
+
+    sources: list[dict] = []
+    for name, res in entries:
+        if res is None:
+            sources.append({"name": name, "fields": {}, "confidences": {}, "elapsed_seconds": 0.0, "error": "ekstraksi gagal (None)"})
+            continue
+        sources.append(
+            {
+                "name": name,
+                "fields": res.fields if isinstance(res.fields, dict) else {},
+                "confidences": (res.extra or {}).get("confidences") or {},
+                "elapsed_seconds": round(res.elapsed_seconds, 2),
+                "error": res.error,
+            }
+        )
+    return sources
+
+
+def _failed_result(name: str, exc: Exception) -> object:
+    from models.base import ModelResult
+
+    return ModelResult("", name, 0.0, error=str(exc))
+
+
+# ---------------------------------------------------------------------------
 # PROSES SATU DOKUMEN
 # ---------------------------------------------------------------------------
 def _zone_ocr(image_path: str, ocr_model) -> dict:
@@ -192,8 +268,7 @@ def _zone_ocr(image_path: str, ocr_model) -> dict:
     kept_lines.extend(hextra.get("kept_lines") or [])
 
     # 2) Zona tabel dari deteksi layout (jika tersedia).
-    # Model layout dimuat per kebutuhan lalu DI-UNLOAD segera: menghemat RAM
-    # (~0.5GB) agar tidak menggeser peak melewati batas saat NuExtract berjalan.
+    # Model layout dimuat per kebutuhan lalu DI-UNLOAD segera: menghemat RAM.
     try:
         layout = get_layout_model()
         layout_zones = layout.detect_zones(image_path)
@@ -235,9 +310,26 @@ def _zone_ocr(image_path: str, ocr_model) -> dict:
     }
 
 
-def process_one(doc: Path, ocr_model, extractor) -> dict:
+def _empty_vlm_meta() -> dict:
+    return {
+        "enabled": config.VLM_API_ENABLED,
+        "used": False,
+        "detected": False,
+        "skip_reason": "",
+        "error": None,
+        "suspicious_lines_count": 0,
+        "corrections": [],
+        "insertions": [],
+        "handwritten_notes": [],
+        "review_changes": [],
+        "elapsed_seconds": 0.0,
+    }
+
+
+def process_one(doc: Path, ocr_model, qwen3, glm) -> dict:
     t_start = time.time()
     doc_type = config.detect_document_type(doc)
+    adapter = "nuextract3_gguf" if config.NUEXTRACT_ENABLED else "vlm_api(fusion)"
 
     image_path, prep_meta = prepare_image(str(doc))
     if image_path is None:
@@ -245,7 +337,7 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
             "document_id": str(uuid.uuid4()),
             "file_name": doc.name,
             "document_type": doc_type,
-            "adapter": "nuextract3_gguf",
+            "adapter": adapter,
             "preprocessing": prep_meta,
             "fields": {},
             "normalised": {},
@@ -254,22 +346,12 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
             "error": prep_meta.get("reject_reason") or "Gagal menyiapkan gambar",
             "validation": {"status": "FAILED", "field_errors": [], "rules": []},
             "ocr": {"included": False, "reason": "no image", "stats": {}},
-            "vlm": {
-                "enabled": config.VLM_API_ENABLED,
-                "used": False,
-                "detected": False,
-                "skip_reason": "no image",
-                "error": None,
-                "suspicious_lines_count": 0,
-                "corrections": [],
-                "insertions": [],
-                "handwritten_notes": [],
-                "review_changes": [],
-                "elapsed_seconds": 0.0,
-            },
+            "vlm": _empty_vlm_meta(),
+            "extraction_sources": [],
+            "fusion": {},
         }
 
-    # 1) PaddleOCR (support) — halaman penuh.
+    # 1) paddleocr-vl 1.6 (API) — halaman penuh.
     ocr_res = ocr_model.run(image_path)
     ocr_extra = ocr_res.extra or {}
 
@@ -295,30 +377,34 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
     )
     ocr_text = decision.filtered_text if decision.include_text else ""
 
-    # 1c) VLM API (GLM-4.6V-Flash) — SELEKTIF untuk tulisan tangan/coretan.
+    # 2) Ekstraksi paralel: qwen3-vl-30b + glm-4.6v-flash (API yang sama).
+    sources = _extract_sources(image_path, doc_type, ocr_text, qwen3, glm)
+
+    # 2b) NuExtract3-GGUF (lokal) — bila diaktifkan, ikut sebagai sumber.
+    extractor = get_extractor()
+    if extractor is not None:
+        ext_res = extractor.run(image_path, doc_type=doc_type, ocr_text=ocr_text)
+        sources.append(
+            {
+                "name": "nuextract",
+                "fields": ext_res.fields if isinstance(ext_res.fields, dict) else {},
+                "confidences": {},
+                "elapsed_seconds": round(ext_res.elapsed_seconds, 2),
+                "error": ext_res.error,
+            }
+        )
+
+    # 3) VLM tulisan tangan/coretan (GLM) — SELEKTIF.
     # A) Heuristik murah (tanpa API) -> B) detect YA/TIDAK -> C) read koreksi.
-    vlm_meta = {
-        "enabled": config.VLM_API_ENABLED,
-        "used": False,
-        "detected": False,
-        "skip_reason": "",
-        "error": None,
-        "suspicious_lines_count": 0,
-        "corrections": [],
-        "insertions": [],
-        "handwritten_notes": [],
-        "review_changes": [],
-        "elapsed_seconds": 0.0,
-    }
+    vlm_meta = _empty_vlm_meta()
     vlm_used = False
-    if config.VLM_API_ENABLED:
+    if config.VLM_API_ENABLED and glm is not None:
         suspicious = detect_handwriting_heuristic(combined_lines)
         vlm_meta["suspicious_lines_count"] = len(suspicious)
         if not suspicious:
             vlm_meta["skip_reason"] = "heuristik: tidak ada indikasi tulisan tangan/coretan"
         else:
-            vlm = get_vlm_model()
-            det = vlm.detect_handwriting(image_path)
+            det = glm.detect_handwriting(image_path)
             vlm_meta["elapsed_seconds"] += det.elapsed_seconds
             if det.error:
                 vlm_meta["error"] = f"detect: {det.error}"
@@ -327,7 +413,7 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
                 vlm_meta["detected"] = True
                 vlm_meta["used"] = True
                 vlm_used = True
-                read_res = vlm.read_handwriting(image_path)
+                read_res = glm.read_handwriting(image_path)
                 vlm_meta["elapsed_seconds"] += read_res.elapsed_seconds
                 if read_res.error:
                     vlm_meta["error"] = f"read: {read_res.error}"
@@ -337,33 +423,22 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
                     vlm_meta["insertions"] = rextra.get("insertions") or []
                     vlm_meta["handwritten_notes"] = rextra.get("handwritten_notes") or []
                     cleaned = (rextra.get("cleaned_text") or "").strip()
-                    # Teks bersih (nilai dicoret DIGANTI pembetulan) ikut ke NuExtract.
+                    # Teks bersih (nilai dicoret DIGANTI pembetulan) ikut sebagai konteks.
                     if cleaned:
                         ocr_text = (ocr_text.strip() + "\n" if ocr_text.strip() else "") + f"[KOREKSI]\n{cleaned}"
             else:
                 vlm_meta["skip_reason"] = "VLM: tidak ada tulisan tangan/coretan"
-    else:
+    elif not config.VLM_API_ENABLED:
         vlm_meta["skip_reason"] = "VLM API dinonaktifkan"
 
-    # 2) NuExtract3-GGUF (main)
-    # OCR/layout sudah tidak dibutuhkan di fase ini: unload + gc dulu supaya
-    # peak RAM saat NuExtract dimuat/dijalankan tetap di bawah batas.
-    try:
-        ocr_model.unload()
-    except Exception:  # noqa: BLE001
-        pass
-    gc.collect()
-    ext = extractor.run(image_path, doc_type=doc_type, ocr_text=ocr_text)
+    # 4) Fusion layer (rule-based, field-aware).
+    fused = fuse_sources(sources)
+    fields = {k: v["value"] for k, v in fused.items() if v.get("value") is not None}
+    fields = {k: v for k, v in fields.items() if str(v).strip() != ""}
 
-    fields = ext.fields if isinstance(ext.fields, dict) else {}
-    # 3) Koreksi field kode/nomor dari OCR (PaddleOCR lebih akurat untuk kode).
-    all_lines = list(ocr_extra.get("all_lines") or []) + list(zone_all_lines)
-    fields = correct_codes_from_ocr(fields, all_lines)
-
-    # 3b) VLM REVIEW: koreksi field memakai nilai pembetulan (audit nilai asli).
-    if vlm_used and not vlm_meta.get("error"):
-        vlm = get_vlm_model()
-        rev = vlm.review_fields(image_path, fields, doc_type=doc_type, ocr_text=ocr_text)
+    # 5) VLM REVIEW: koreksi field memakai nilai pembetulan (audit nilai asli).
+    if vlm_used and glm is not None and not vlm_meta.get("error"):
+        rev = glm.review_fields(image_path, fields, doc_type=doc_type, ocr_text=ocr_text)
         vlm_meta["elapsed_seconds"] += rev.elapsed_seconds
         if rev.error:
             vlm_meta["error"] = f"review: {rev.error}"
@@ -385,19 +460,31 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
                 fields[field] = new_val
             vlm_meta["review_changes"] = applied
 
+    # 6) Koreksi field kode/nomor dari OCR (paddleocr-vl lebih akurat untuk kode).
+    all_lines = list(ocr_extra.get("all_lines") or []) + list(zone_all_lines)
+    fields = correct_codes_from_ocr(fields, all_lines)
+
+    # 7) Normalisasi + validasi.
     normalised = normalise_fields(fields)
     validation = validate_document(doc_type, normalised)
     elapsed_ms = round((time.time() - t_start) * 1000, 2)
+
+    confs = [
+        v.get("confidence")
+        for v in fused.values()
+        if isinstance(v.get("confidence"), (int, float)) and v.get("value") is not None
+    ]
+    confidence = round(sum(confs) / len(confs), 3) if confs else 0.0
 
     result = {
         "document_id": str(uuid.uuid4()),
         "file_name": doc.name,
         "document_type": doc_type,
-        "adapter": "nuextract3_gguf",
+        "adapter": adapter,
         "preprocessing": prep_meta,
         "fields": fields,
         "normalised": normalised,
-        "confidence": 0.9,
+        "confidence": confidence,
         "processing_time_ms": elapsed_ms,
         "validation": validation,
         "ocr": {
@@ -419,7 +506,9 @@ def process_one(doc: Path, ocr_model, extractor) -> dict:
             "header_text": header_meta.get("text", ""),
         },
         "vlm": vlm_meta,
-        "error": ext.error,
+        "extraction_sources": sources,
+        "fusion": fused,
+        "error": None,
     }
 
     out_name = f"{doc_type}_{doc.stem}.json"
@@ -445,13 +534,17 @@ def run(paths: list[str] | None = None) -> list[dict]:
         print(f"  {i:>2}. {shown}")
 
     ocr_model = get_ocr_model()
-    extractor = get_extractor()
-    print("\n[INFO] Model siap (NuExtract3-GGUF main + PaddleOCR support). Memulai ekstraksi...\n")
+    qwen3 = get_qwen3_model()
+    glm = get_glm_model()
+    print(
+        "\n[INFO] Model siap: paddleocr-vl 1.6 + qwen3-vl-30b + glm-4.6v-flash "
+        "(semua via API OpenAI-compatible). Memulai ekstraksi...\n"
+    )
 
     results: list[dict] = []
     for doc in documents:
         print(f"\n{'=' * 70}\nDOKUMEN: {doc.name}")
-        result = process_one(doc, ocr_model, extractor)
+        result = process_one(doc, ocr_model, qwen3, glm)
         results.append(result)
         _print_result(result)
 
@@ -472,6 +565,9 @@ def _print_result(result: dict) -> None:
         print(f"  ERROR      : {result['error']}")
     ocr = result.get("ocr", {})
     print(f"  OCR support: {'Ya' if ocr.get('included') else 'Tidak'} ({ocr.get('reason', '')})")
+    for src in result.get("extraction_sources") or []:
+        err = f" (err: {src.get('error')})" if src.get("error") else ""
+        print(f"  sumber {src.get('name'):<10}: {src.get('elapsed_seconds', 0.0)}s{err}")
     for key, value in (result.get("normalised") or {}).items():
         print(f"  {key:<22}: {value}")
     for fe in result["validation"].get("field_errors") or []:
@@ -500,10 +596,6 @@ def _summarise(results: list[dict]) -> str:
         )
     return header + "\n".join(lines)
 
-
-def build_ui():
-    """Bangun UI Gradio. Hanya impor models.registry (aturan AGENT.md)."""
-    import gradio as gr
 
 def _resolve_upload_paths(files) -> list[str]:
     """Konversi output gr.File (str / FileData) ke path absolut yang valid."""
@@ -546,10 +638,11 @@ def build_ui():
     with gr.Blocks(title="nu-paddle — Ekstraksi Dokumen") as demo:
         gr.Markdown(
             "# nu-paddle — Ekstraksi Dokumen\n"
-            "**NuExtract3-GGUF** (model utama) + **PaddleOCR** (support) dipakai "
-            "otomatis — tidak perlu memilih model. Upload dokumen, hasil seluruh "
-            "field + teks OCR lengkap langsung keluar. Setiap dokumen melewati "
-            "quality check lalu preprocessing AI-Document."
+            "**paddleocr-vl 1.6** (OCR) + **qwen3-vl-30b** + **glm-4.6v-flash** "
+            "(ekstraksi VLM) dipakai otomatis via API OpenAI-compatible — tidak "
+            "perlu memilih model. Upload dokumen, hasil seluruh field + teks OCR "
+            "lengkap langsung keluar. Setiap dokumen melewati quality check lalu "
+            "preprocessing AI-Document."
         )
         files = gr.File(
             file_count="multiple",
@@ -561,17 +654,14 @@ def build_ui():
         summary = gr.Markdown("_Upload dokumen atau klik 'Ekstrak Semua Contoh' untuk memulai._")
         details = gr.JSON(label="Hasil detail")
 
-        # Auto-ekstrak begitu file di-upload (hasil sebelumnya langsung diganti,
-        # tidak menampilkan hasil dokumen lain).
-        # concurrency_limit=1 -> satu ekstraksi berjalan, sisanya antri (anti OOM).
+        # Auto-ekstrak begitu file di-upload.
+        # concurrency_limit=1 -> satu ekstraksi berjalan, sisanya antri.
         files.upload(extract_uploaded, inputs=files, outputs=[summary, details], concurrency_limit=1)
         btn_all.click(extract_all, outputs=[summary, details], concurrency_limit=1)
         btn_clear.click(
             lambda: ("_Siap. Upload dokumen untuk memulai._", None),
             outputs=[summary, details],
         )
-
-    return demo
 
     return demo
 

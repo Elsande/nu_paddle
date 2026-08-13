@@ -1,21 +1,24 @@
-"""Implementasi PaddleOCR sebagai model pendukung (role="support").
+"""paddleocr-vl 1.6 via API — pengganti PaddleOCR lokal (role="support").
 
-Tidak menghasilkan hasil akhir; hanya memberi teks + confidence + bbox sebagai
-konteks pendukung untuk NuExtract3-GGUF (model utama). Logika diambil dari
-project ``paddleocr/invoice-doc-ai`` (detect-then-recognize + CLAHE + spatial
-sort), yang sudah terbukti bekerja di mesin ini.
+Tidak ada lagi model PaddleOCR yang dimuat lokal. paddleocr-vl 1.6 dipanggil
+lewat gateway OpenAI-compatible yang SAMA dengan qwen3-vl & glm
+(``config.VLM_API_BASE_URL``), nama model dari ``config.PADDLEOCR_VL_MODEL``.
 
-PENTING:
-- Engine di-load sekali (singleton lazy) untuk hemat RAM.
-- PaddleX dipatch ke mode offline supaya memakai model lokal
-  ``~/.paddlex/official_models`` (tidak pernah download dari internet).
+Output model (JSON ``{"texts": [...]}``) di-parse menjadi baris OCR dengan
+struktur yang sama seperti dulu PaddleOCR lokal: text + bbox + confidence,
+lalu di-sort spasial. Interface ``run()`` / ``run_region()`` / ``run_header()``
+dipertahankan agar `run_batch._zone_ocr` tidak perlu diubah perilakunya.
+
+Bila model tidak mengembalikan bbox/confidence, digunakan default netral
+(``PADDLEOCR_VL_DEFAULT_CONFIDENCE``) supaya heuristik tulisan tangan tidak
+menjadi salah trigger dan koreksi kode OCR tidak asal diterapkan.
 """
 
 from __future__ import annotations
 
 import os
+import tempfile
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 import cv2
@@ -25,82 +28,19 @@ from config import (
     LAYOUT_ZONE_MARGIN,
     LAYOUT_ZONE_MAX_DIM,
     OCR_CONFIDENCE_THRESHOLD,
-    PADDLEOCR_PARAMS,
+    PADDLEOCR_VL_DEFAULT_CONFIDENCE,
+    PADDLEOCR_VL_SYSTEM_PROMPT,
+    PADDLEOCR_VL_USER_PROMPT,
+    VLM_API_MAX_SIDE,
 )
-from models.base import BaseExtractionModel, ModelResult
-
-_LOCAL_MODELS_ROOT = Path(os.path.expanduser("~/.paddlex/official_models"))
-
-# ---------------------------------------------------------------------------
-# OFFLINE PATCH — Paksa PaddleX memakai model lokal (mencegah download).
-# ---------------------------------------------------------------------------
-def _find_local_model(name: str) -> Path:
-    names = (name,) if isinstance(name, str) else tuple(name)
-    for n in names:
-        for candidate in (_LOCAL_MODELS_ROOT / n, _LOCAL_MODELS_ROOT / n.replace("_infer", "")):
-            if candidate.exists():
-                return candidate
-        base = n.replace("_infer", "")
-        sub = _LOCAL_MODELS_ROOT / base / f"{base}_infer"
-        if sub.exists():
-            return sub
-        for p in _LOCAL_MODELS_ROOT.iterdir():
-            if p.is_dir() and (n in p.name or base in p.name or p.name in n):
-                return p
-    raise FileNotFoundError(
-        f"[OFFLINE] Model '{names[0]}' tidak ditemukan di {_LOCAL_MODELS_ROOT}. "
-        "Download model dulu (satu kali) agar offline patch berfungsi."
-    )
-
-
-def _patch_paddlex_offline() -> None:
-    try:
-        import importlib
-
-        om_mod = importlib.import_module("paddlex.inference.utils.official_models")
-
-        def _patched_local_path(self, model_name):
-            return _find_local_model(model_name)
-
-        def _patched_get_path(self, model_name, *, model_formats=None):
-            return _find_local_model(model_name)
-
-        def _patched_build_hosters(self):
-            return []
-
-        if hasattr(om_mod, "_ModelManager"):
-            om_mod._ModelManager._get_model_local_path = _patched_local_path
-            om_mod._ModelManager.get_model_path = _patched_get_path
-            om_mod._ModelManager._build_hosters = _patched_build_hosters
-        if hasattr(om_mod, "official_models"):
-            inst = om_mod.official_models
-            inst._get_model_local_path = lambda *a, **kw: _patched_local_path(inst, *a, **kw)
-            inst.get_model_path = lambda *a, **kw: _patched_get_path(inst, *a, **kw)
-            inst._build_hosters = _patched_build_hosters
-    except Exception:
-        pass
-
-
-_patch_paddlex_offline()
+from models.base import ModelResult
+from models.nuextract_gguf_model import extract_json
+from models.vlm_api_model import OpenAIVLModel
 
 
 # ---------------------------------------------------------------------------
 # HELPER GAMBAR
 # ---------------------------------------------------------------------------
-def _apply_clahe(image_np: np.ndarray, clip_limit: float = 2.0, tile_grid_size: tuple = (8, 8)) -> np.ndarray:
-    """CLAHE pada channel Luminance (YCrCb). Input/output: OpenCV BGR."""
-    if image_np is None or image_np.size == 0:
-        return image_np
-    if image_np.ndim == 2:
-        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
-        return clahe.apply(image_np)
-    ycrcb = cv2.cvtColor(image_np, cv2.COLOR_BGR2YCrCb)
-    y_chan, cr_chan, cb_chan = cv2.split(ycrcb)
-    y_enhanced = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size).apply(y_chan)
-    merged = cv2.merge((y_enhanced, cr_chan, cb_chan))
-    return cv2.cvtColor(merged, cv2.COLOR_YCrCb2BGR)
-
-
 def _sort_boxes_spatially(lines_data: list[dict]) -> list[dict]:
     """Urutkan baris OCR berdasarkan Y (baris) lalu X (kolom) — urutan baca wajar."""
     valid_boxes: list[tuple] = []
@@ -139,60 +79,85 @@ def _sort_boxes_spatially(lines_data: list[dict]) -> list[dict]:
     return sorted_lines + invalid_boxes
 
 
-# ---------------------------------------------------------------------------
-# MODEL
-# ---------------------------------------------------------------------------
-class PaddleOCRModel(BaseExtractionModel):
-    """PaddleOCR sebagai OCR pendukung: teks + confidence + bbox per baris."""
+class PaddleOCRVLApiModel(OpenAIVLModel):
+    """paddleocr-vl 1.6 via API: teks + confidence + bbox per baris OCR."""
 
-    name = "PaddleOCR"
+    name = "PaddleOCR-VL 1.6 (API)"
     role = "support"
 
-    def __init__(self, params: Optional[dict] = None, confidence_threshold: float = OCR_CONFIDENCE_THRESHOLD):
-        self._engine: Any = None
-        self._params: dict = dict(PADDLEOCR_PARAMS, **(params or {}))
+    def __init__(
+        self,
+        confidence_threshold: float = OCR_CONFIDENCE_THRESHOLD,
+        max_side: int = VLM_API_MAX_SIDE,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
         self.confidence_threshold = confidence_threshold
+        self.max_side = max_side
 
-    def load(self) -> None:
-        if self._engine is not None:
-            return
-        try:
-            import paddle
+    # -- parsing -----------------------------------------------------------
+    def _parse_ocr_lines(self, text: str) -> list[dict]:
+        """Parse output model (JSON ``{"texts": [...]}``) menjadi baris OCR.
 
-            if hasattr(paddle, "disable_signal_handler"):
-                paddle.disable_signal_handler()
-        except Exception:
-            pass
-        from paddleocr import PaddleOCR
-
-        self._engine = PaddleOCR(**self._params)
-
-    def _predict_image(self, img) -> tuple[list[dict], list[dict]]:
-        """CLAHE -> predict -> spatial sort. Kembalikan (semua baris, baris tersaring)."""
-        clahe_img = _apply_clahe(img)
-        pred_results = list(self._engine.predict(clahe_img))
-
+        Degrade halus: bila output bukan JSON sesuai format, baris teks mentah
+        dipakai apa adanya (bbox=None, confidence=default netral).
+        """
         lines: list[dict] = []
-        for result in pred_results:
-            if hasattr(result, "get"):
-                rec_texts = result.get("rec_texts", [])
-                rec_scores = result.get("rec_scores", [])
-                rec_polys = result.get("rec_polys", result.get("dt_polys", []))
-            else:
-                rec_texts = getattr(result, "rec_texts", [])
-                rec_scores = getattr(result, "rec_scores", [])
-                rec_polys = getattr(result, "rec_polys", getattr(result, "dt_polys", []))
+        try:
+            data = extract_json(text)
+            if isinstance(data, dict) and isinstance(data.get("texts"), list):
+                for item in data["texts"]:
+                    t = str(item.get("text") or "").strip()
+                    if not t:
+                        continue
+                    bbox = item.get("bbox")
+                    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+                        bbox = None
+                    else:
+                        try:
+                            bbox = [float(v) for v in bbox]
+                        except (TypeError, ValueError):
+                            bbox = None
+                    conf = item.get("confidence")
+                    if isinstance(conf, (int, float)):
+                        conf = float(conf)
+                    else:
+                        conf = PADDLEOCR_VL_DEFAULT_CONFIDENCE
+                    lines.append({"text": t, "bbox": bbox, "confidence": conf})
+        except Exception:
+            lines = []
 
-            for i, text in enumerate(rec_texts):
-                text_str = str(text).strip()
-                if not text_str:
-                    continue
-                score = float(rec_scores[i]) if i < len(rec_scores) else 1.0
-                poly = rec_polys[i] if (rec_polys is not None and i < len(rec_polys)) else None
-                bbox = poly.tolist() if hasattr(poly, "tolist") else (list(poly) if poly is not None else None)
-                lines.append({"bbox": bbox, "text": text_str, "confidence": score})
+        if not lines:
+            for ln in (text or "").splitlines():
+                ln = ln.strip()
+                if ln:
+                    lines.append(
+                        {
+                            "text": ln,
+                            "bbox": None,
+                            "confidence": PADDLEOCR_VL_DEFAULT_CONFIDENCE,
+                        }
+                    )
+        return _sort_boxes_spatially(lines)
 
-        lines = _sort_boxes_spatially(lines)
+    @staticmethod
+    def _save_temp_image(crop: np.ndarray) -> str:
+        """Simpan crop (BGR ndarray) ke file PNG sementara."""
+        fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="paddleocr_vl_")
+        os.close(fd)
+        cv2.imwrite(tmp_path, crop)
+        return tmp_path
+
+    # -- inference ---------------------------------------------------------
+    def _predict_image(self, image_path: str) -> tuple[list[dict], list[dict]]:
+        """paddleocr-vl via API + spatial sort. (semua baris, baris tersaring)."""
+        text = self._chat(
+            image_path,
+            PADDLEOCR_VL_USER_PROMPT,
+            max_side=self.max_side,
+            system_prompt=PADDLEOCR_VL_SYSTEM_PROMPT,
+        )
+        lines = self._parse_ocr_lines(text)
         kept = [ln for ln in lines if ln["confidence"] >= self.confidence_threshold]
         return lines, kept
 
@@ -200,11 +165,7 @@ class PaddleOCRModel(BaseExtractionModel):
         t0 = time.time()
         self.load()
         try:
-            raw_img = cv2.imread(image_path)
-            if raw_img is None:
-                return ModelResult("", self.name, 0.0, error=f"Gambar tidak terbaca: {image_path}")
-
-            lines, kept = self._predict_image(raw_img)
+            lines, kept = self._predict_image(image_path)
             filtered_text = "\n".join(ln["text"] for ln in kept)
             elapsed = time.time() - t0
             return ModelResult(
@@ -260,7 +221,22 @@ class PaddleOCRModel(BaseExtractionModel):
                 f = LAYOUT_ZONE_MAX_DIM / max_dim
                 crop = cv2.resize(crop, None, fx=f, fy=f, interpolation=cv2.INTER_AREA)
 
-            lines, kept = self._predict_image(crop)
+            tmp_path = self._save_temp_image(crop)
+            try:
+                text = self._chat(
+                    tmp_path,
+                    PADDLEOCR_VL_USER_PROMPT,
+                    max_side=self.max_side,
+                    system_prompt=PADDLEOCR_VL_SYSTEM_PROMPT,
+                )
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
+            lines = self._parse_ocr_lines(text)
+            kept = [ln for ln in lines if ln["confidence"] >= self.confidence_threshold]
             filtered_text = "\n".join(ln["text"] for ln in kept)
             return ModelResult(
                 filtered_text,
@@ -283,7 +259,7 @@ class PaddleOCRModel(BaseExtractionModel):
     def run_header(self, image_path: str, top_ratio: float = 0.22, scale: float = 2.0) -> ModelResult:
         """OCR pas kedua khusus area HEADER (logo/kop) — fallback tanpa layout.
 
-        Crop 22% atas halaman + upscale 2x agar teks di dalam logo terbaca.
+        Crop bagian atas halaman + upscale agar teks di dalam logo terbaca.
         Didelegasikan ke :meth:`run_region` dengan bbox atas (satu jalur kode).
         """
         raw_img = cv2.imread(image_path)
@@ -298,4 +274,4 @@ class PaddleOCRModel(BaseExtractionModel):
         )
 
     def unload(self) -> None:
-        self._engine = None
+        super().unload()

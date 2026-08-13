@@ -1,8 +1,13 @@
 """
 config.py
 ==========
-Konfigurasi terpusat untuk nu-paddle (NuExtract3-GGUF main + PaddleOCR support
-+ VLM API GLM-4.6V-Flash untuk tulisan tangan/coretan).
+Konfigurasi terpusat untuk nu-paddle.
+
+Arsitektur baru:
+- paddleocr-vl 1.6, qwen3-vl-30b, dan glm-4.6v-flash semuanya dipanggil
+  LEWAT API OpenAI-compatible yang SAMA (gateway lokal perusahaan), beda nama
+  model. Tidak ada lagi PaddleOCR yang dimuat lokal.
+- NuExtract3-GGUF (lokal) sementara OFF (flag NUEXTRACT_ENABLED).
 """
 
 from __future__ import annotations
@@ -29,30 +34,50 @@ MAX_NEW_TOKENS = 1024
 ENABLE_THINKING = False  # non-reasoning, cepat & deterministik
 
 # ---------------------------------------------------------------------------
-# OCR PENDUKUNG — PaddleOCR
+# NuExtract3-GGUF (lokal) — SEMENTARA OFF.
+# Pipeline sekarang memakai 3 sumber VLM via API. NuExtract tetap ada di
+# registry (`models/registry.py`) tapi tidak dimuat/dijalankan selama False.
 # ---------------------------------------------------------------------------
-PADDLEOCR_PARAMS = {
-    "lang": "en",
-    "device": "cpu",
-    "enable_mkldnn": False,          # hindari crash oneDNN/PIR di CPU
-    "text_det_limit_side_len": 960,  # batasi ukuran saat deteksi -> hemat RAM
-    "text_det_unclip_ratio": 2.0,    # cegah teks terpotong di tepi box
-}
+NUEXTRACT_ENABLED = False
 
-# Baris OCR dengan confidence di bawah ini dibuang (tidak dikirim ke NuExtract).
+# ---------------------------------------------------------------------------
+# OCR PENDUKUNG — paddleocr-vl 1.6 via API (gateway OpenAI-compatible).
+# Model TIDAK dimuat lokal; cukup HTTP client ringan.
+# ---------------------------------------------------------------------------
+# Baris OCR dengan confidence di bawah ini dibuang (tidak dikirim ke extractor).
 OCR_CONFIDENCE_THRESHOLD = 0.6
 
+# Prompt OCR untuk paddleocr-vl 1.6. Output model di-parse menjadi baris OCR
+# (text + bbox + confidence) — sama seperti dulu output PaddleOCR lokal.
+PADDLEOCR_VL_SYSTEM_PROMPT = (
+    "Kamu adalah mesin OCR dokumen. Baca SELURUH teks yang terlihat pada gambar, "
+    "jangan menebak atau melengkapi. Jangan terjemahkan bahasa aslinya."
+)
+PADDLEOCR_VL_USER_PROMPT = (
+    "Lakukan OCR pada gambar dokumen ini dan kembalikan HANYA JSON valid dengan "
+    'format: {"texts": [{"text": "<teks>", "bbox": [x1,y1,x2,y2] atau null, '
+    '"confidence": 0.0}]}. Tulis seluruh teks yang terlihat, urutkan sesuai '
+    "posisi baca (atas ke bawah, kiri ke kanan). Tidak ada teks lain di luar JSON."
+)
+# Confidence default bila model tidak mengembalikannya (netral: tidak memicu
+# heuristik tulisan tangan dan tidak dipakai untuk koreksi kode OCR).
+PADDLEOCR_VL_DEFAULT_CONFIDENCE = 0.5
+
 # ---------------------------------------------------------------------------
-# VLM API — GLM-4.6V-Flash (Z.AI) via API lokal OpenAI-compatible.
-# Dipakai SELEKTIF untuk tulisan tangan / coretan (ciretan) & pembetulan di
-# sebelahnya. Model TIDAK dimuat lokal — cukup HTTP client.
+# VLM API — paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash (SATU gateway).
+# Ketiga model dipanggil lewat API OpenAI-compatible yang SAMA
+# (default gateway lokal perusahaan); yang membedakan hanyalah nama model.
 # ---------------------------------------------------------------------------
 VLM_API_ENABLED = True
 # Base URL gateway lokal (OpenAI-compatible). Override via env var.
 VLM_API_BASE_URL = os.environ.get("VLM_API_BASE_URL", "http://10.0.1.250:1234/v1")
 VLM_API_KEY = os.environ.get("VLM_API_KEY", "lm-studio")
-VLM_API_MODEL = os.environ.get("VLM_API_MODEL", "zai-org/glm-4.6v-flash")
 VLM_API_TIMEOUT = int(os.environ.get("VLM_API_TIMEOUT", "180"))
+
+# Nama model di gateway (override via env var).
+PADDLEOCR_VL_MODEL = os.environ.get("PADDLEOCR_VL_MODEL", "paddleocr-vl-1.6")
+QWEN3_VL_MODEL = os.environ.get("QWEN3_VL_MODEL", "qwen3-vl-30b")
+GLM_VL_MODEL = os.environ.get("GLM_VL_MODEL", "zai-org/glm-4.6v-flash")
 
 # Sisi terpanjang maksimal gambar yang dikirim (fit penuh halaman).
 VLM_API_MAX_SIDE = 1600
@@ -61,7 +86,7 @@ VLM_API_READ_MAX_SIDE = 2400
 VLM_API_JPEG_QUALITY = 92
 VLM_API_MAX_NEW_TOKENS = 8192
 VLM_API_TEMPERATURE = 0.0
-# Nonaktifkan chain-of-thought GLM (lebih cepat & deterministik).
+# Nonaktifkan chain-of-thought (lebih cepat & deterministik).
 VLM_API_DISABLE_THINKING = True
 
 # ---------------------------------------------------------------------------

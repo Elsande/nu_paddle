@@ -116,7 +116,7 @@ def correct_codes_from_ocr(fields: dict, ocr_lines: list[dict]) -> dict:
     candidates = []
     for ln in ocr_lines:
         text = re.sub(r"^[\W_]+", "", (ln.get("text") or "").strip())  # buang ":" di depan
-        if len(text) >= _OCR_MIN_LEN and float(ln.get("confidence", 0.0)) >= _OCR_MIN_CONF:
+        if len(text) >= _OCR_MIN_LEN and float(ln.get("confidence") or 0.0) >= _OCR_MIN_CONF:
             candidates.append(text)
     if not candidates:
         return fields

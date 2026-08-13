@@ -9,7 +9,7 @@ Dokumen ini menjelaskan alur final pipeline ekstraksi & validasi dokumen bisnis 
 ```
 [Gambar Dokumen]
         │
-        ├──► paddleocr       (selalu jalan, ringan)
+        ├──► paddleocr-vl 1.6       (selalu jalan, ringan)
         ├──► qwen3-vl-30b        (selalu jalan, berat)
         ├──► glm-4.6v-flash      (selalu jalan, berat)
         └──► NuExtract3          (selalu jalan, ringan)
@@ -37,7 +37,7 @@ Dokumen ini menjelaskan alur final pipeline ekstraksi & validasi dokumen bisnis 
         [OUTPUT FINAL: JSON valid / flag review manual]
 ```
 
-**Total model yang dipakai: 5** — paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (dipakai 2x di 2 slot berbeda), dan gemma4:31b (on-demand saja).
+**Total model yang dipakai: 5** — paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (dipakai 2x di 2 slot berbeda), dan gemma4:31b (on-demand saja).
 
 ---
 
@@ -45,7 +45,7 @@ Dokumen ini menjelaskan alur final pipeline ekstraksi & validasi dokumen bisnis 
 
 ### 2.1. Kenapa 4 sumber ekstraksi jalan PARALEL, bukan berurutan?
 
-Keempat sumber (paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3) sama-sama membaca **gambar dokumen yang sama**, dari titik nol, secara independen — tidak ada satupun yang butuh hasil dari sumber lain untuk mulai bekerja.
+Keempat sumber (paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash, NuExtract3) sama-sama membaca **gambar dokumen yang sama**, dari titik nol, secara independen — tidak ada satupun yang butuh hasil dari sumber lain untuk mulai bekerja.
 
 - Kalau dijalankan berurutan (satu selesai, baru yang berikutnya mulai), total waktu proses = penjumlahan waktu semua model = lambat.
 - Kalau dijalankan paralel, total waktu proses = waktu model yang paling lambat saja.
@@ -58,18 +58,18 @@ Setiap sumber punya kekuatan dan kelemahan berbeda — kombinasinya saling menut
 
 | Sumber | Kekuatan | Kelemahan |
 |---|---|---|
-| paddleocr | Akurat di level karakter/posisi (bounding box) | Tidak paham konteks/makna, gagal di layout rumit |
+| paddleocr-vl 1.6 | Akurat di level karakter/posisi (bounding box) | Tidak paham konteks/makna, gagal di layout rumit |
 | qwen3-vl-30b | Paham konteks semantik, bisa baca tulisan tangan | Berat, kadang halusinasi angka |
 | glm-4.6v-flash | Kuat di dense document/table parsing, arsitektur beda dari Qwen (bagus untuk cross-check) | Berat |
 | NuExtract3 | Sangat konsisten mengikuti schema JSON, ringan (4B) | **Tidak bisa membaca tulisan tangan sama sekali** |
 
 Kalau cuma pakai 1 sumber, error dari sumber itu langsung lolos tanpa ada yang mengoreksi. Dengan 4 sumber, **fusion layer** bisa membandingkan dan mengambil keputusan per-field berdasarkan siapa yang paling bisa dipercaya untuk jenis field tersebut.
 
-### 2.3. Kenapa paddleocr dan NuExtract3 "selalu jalan", tapi gemma4:31b cuma "on-demand"?
+### 2.3. Kenapa paddleocr-vl 1.6 dan NuExtract3 "selalu jalan", tapi gemma4:31b cuma "on-demand"?
 
 Alasannya murni **cost/beban komputasi**, bukan soal akurasi:
 
-- **paddleocr** bukan LLM generatif — dia OCR engine biasa, sangat ringan dan cepat. Tidak ada alasan untuk tidak menjalankannya tiap dokumen.
+- **paddleocr-vl 1.6** bukan LLM generatif — dia OCR engine biasa, sangat ringan dan cepat. Tidak ada alasan untuk tidak menjalankannya tiap dokumen.
 - **NuExtract3** cuma 4 miliar parameter — jauh lebih kecil dari qwen3-vl-30b (30B) atau glm-4.6v-flash. Biaya menjalankan dia tiap dokumen kecil.
 - **gemma4:31b** setara besar dengan qwen3-vl-30b (puluhan miliar parameter) — mahal kalau dipanggil di setiap dokumen, padahal di sebagian besar kasus qwen3-vl-30b dan glm-4.6v-flash sudah **sepakat** satu sama lain. Maka gemma4:31b hanya dipanggil sebagai **tie-breaker**, khusus untuk field yang hasilnya berbeda antara qwen3-vl-30b dan glm-4.6v-flash — bukan untuk seluruh dokumen.
 
@@ -102,8 +102,8 @@ NuExtract3 memang **tidak dilatih untuk membaca tulisan tangan/handwriting** —
 
 | Jenis Field | Sumber yang Boleh Vote |
 |---|---|
-| Teks cetak (nomor dokumen, tanggal, nominal, nama pihak, item) | paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (4 suara) |
-| Tulisan tangan / anotasi / koreksi manual | qwen3-vl-30b, glm-4.6v-flash saja (2 suara, PaddleOCR & NuExtract3 di-exclude) |
+| Teks cetak (nomor dokumen, tanggal, nominal, nama pihak, item) | paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (4 suara) |
+| Tulisan tangan / anotasi / koreksi manual | qwen3-vl-30b, glm-4.6v-flash saja (2 suara, paddleocr-vl 1.6 & NuExtract3 di-exclude) |
 
 ### 2.5. Kenapa fusion layer HARUS ada — tidak bisa langsung ke output?
 
@@ -114,8 +114,8 @@ Karena setiap sumber punya cara baca dan tingkat kepercayaan berbeda per jenis f
 | Tipe Field | Prioritas Utama | Alasan |
 |---|---|---|
 | Numerik (harga, qty, total, subtotal, pajak) | VLM (qwen3-vl / glm-4.6v) | Paham konteks tabel, bisa membedakan "Total" vs "Subtotal" walau posisinya berdekatan |
-| ID/Kode (nomor dokumen, NPWP, nomor PO) | paddleocr | Akurat di level karakter literal |
-| Teks bebas (nama pihak, catatan) | VLM, dengan fallback ke PaddleOCR jika confidence VLM rendah | Butuh pemahaman konteks, tapi tetap perlu validasi karakter |
+| ID/Kode (nomor dokumen, NPWP, nomor PO) | paddleocr-vl 1.6 | Akurat di level karakter literal |
+| Teks bebas (nama pihak, catatan) | VLM, dengan fallback ke paddleocr-vl 1.6 jika confidence VLM rendah | Butuh pemahaman konteks, tapi tetap perlu validasi karakter |
 | Schema-critical (format wajib konsisten) | NuExtract3 sebagai tie-breaker | Dilatih khusus schema-adherence |
 | Tulisan tangan / anotasi | qwen3-vl-30b, glm-4.6v-flash (majority vote 2 sumber) | Hanya sumber ini yang punya kapabilitas baca handwriting |
 
@@ -126,7 +126,7 @@ Ini poin penting yang sering disalahpahami. NuExtract3 dipakai di **dua slot ber
 **Slot 1 — Extraction (sebelum fusion):**
 - Input: **gambar dokumen** (mentah)
 - Tugas: baca teks cetak langsung dari gambar, hasilkan JSON semi-final
-- Nilai unik di sini: dia jadi salah satu "opini independen" tambahan yang membaca gambar yang sama dengan sudut pandang berbeda dari PaddleOCR/qwen3-vl/glm-4.6v — menambah keragaman suara untuk voting di fusion layer, khususnya karena kekuatan schema-adherence-nya.
+- Nilai unik di sini: dia jadi salah satu "opini independen" tambahan yang membaca gambar yang sama dengan sudut pandang berbeda dari paddleocr-vl 1.6/qwen3-vl/glm-4.6v — menambah keragaman suara untuk voting di fusion layer, khususnya karena kekuatan schema-adherence-nya.
 
 **Slot 2 — Structuring & Validasi Format (setelah fusion):**
 - Input: **teks/JSON hasil fusion** (bukan gambar lagi)
@@ -154,7 +154,7 @@ Urutan ini memastikan setiap tahap bekerja dengan data yang sudah "bersih" dari 
 Dokumen (Invoice/Kwitansi/Faktur Pajak/Berita Acara/Delivery Order/PO) masuk sebagai gambar (hasil scan/foto).
 
 **Step 2 — Ekstraksi Paralel (4 sumber, selalu jalan bersamaan)**
-- paddleocr membaca teks cetak berbasis deteksi karakter/posisi.
+- paddleocr-vl 1.6 membaca teks cetak berbasis deteksi karakter/posisi.
 - qwen3-vl-30b membaca teks cetak dan tulisan tangan secara semantik.
 - glm-4.6v-flash membaca teks cetak dan tulisan tangan sebagai pembanding arsitektur berbeda.
 - NuExtract3 membaca teks cetak langsung ke format JSON schema-strict.
@@ -171,8 +171,8 @@ gemma4:31b dipanggil, tapi HANYA untuk field yang berbeda dari Step 3 — bukan 
 
 **Step 5 — Fusion Layer**
 Sistem menggabungkan semua hasil ekstraksi menjadi satu representasi konsolidasi, dengan aturan:
-- Field teks cetak: voting dari paddleocr, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (dan gemma4:31b jika dipanggil).
-- Field tulisan tangan: voting hanya dari qwen3-vl-30b dan glm-4.6v-flash (dan gemma4:31b jika dipanggil) — paddleocr dan NuExtract3 di-exclude dari field ini.
+- Field teks cetak: voting dari paddleocr-vl 1.6, qwen3-vl-30b, glm-4.6v-flash, NuExtract3 (dan gemma4:31b jika dipanggil).
+- Field tulisan tangan: voting hanya dari qwen3-vl-30b dan glm-4.6v-flash (dan gemma4:31b jika dipanggil) — paddleocr-vl 1.6 dan NuExtract3 di-exclude dari field ini.
 - Setiap field diberi label `source_used` dan `had_conflict` untuk keperluan audit.
 
 **Step 6 — Structuring & Validasi Format**
@@ -282,10 +282,10 @@ sesuai template di atas. Jangan menebak nilai yang tidak terlihat jelas —
 isi dengan null.
 ```
 
-### 4.3. Konfigurasi paddleocr (bukan prompt, tapi format output wajib)
+### 4.3. Konfigurasi paddleocr-vl 1.6 (bukan prompt, tapi format output wajib)
 
 ```
-Output paddleocr wajib di-post-process ke struktur:
+Output paddleocr-vl 1.6 wajib di-post-process ke struktur:
 {
   "raw_text_blocks": [
     {"text": "<string>", "bbox": [x1,y1,x2,y2], "confidence": 0.0}
@@ -298,11 +298,11 @@ Mapping `raw_text_blocks` ke field-field yang sama seperti schema VLM di atas di
 
 ```python
 FIELD_PRIORITY = {
-    "numeric": ["vlm_qwen3", "vlm_glm", "gemma_tiebreak", "paddleocr", "nuextract3"],
-    "id_code": ["paddleocr", "vlm_qwen3", "vlm_glm", "nuextract3"],
-    "free_text": ["vlm_qwen3", "paddleocr", "vlm_glm", "nuextract3"],
+    "numeric": ["vlm_qwen3", "vlm_glm", "gemma_tiebreak", "paddleocr-vl 1.6", "nuextract3"],
+    "id_code": ["paddleocr-vl 1.6", "vlm_qwen3", "vlm_glm", "nuextract3"],
+    "free_text": ["vlm_qwen3", "paddleocr-vl 1.6", "vlm_glm", "nuextract3"],
     "schema_critical": ["nuextract3", "vlm_qwen3", "vlm_glm"],
-    "handwriting": ["vlm_qwen3", "vlm_glm", "gemma_tiebreak"],  # paddleocr & nuextract3 di-exclude
+    "handwriting": ["vlm_qwen3", "vlm_glm", "gemma_tiebreak"],  # paddleocr-vl 1.6 & nuextract3 di-exclude
 }
 CONFIDENCE_OVERRIDE_THRESHOLD = 0.3
 

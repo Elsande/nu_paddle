@@ -1,9 +1,10 @@
 # AGENT.md — Aturan Kerja di Project nu-paddle
 
-Project gabungan **doc-validation + paddleocr** dengan preprocessing dari
-**AI-Document**. Arsitektur: NuExtract3-GGUF (model utama, JSON terstruktur)
-dibantu PaddleOCR (support, sumber teks + confidence) dan **GLM-4.6V-Flash via
-API** (support, tulisan tangan/coretan — dipanggil selektif).
+Arsitektur baru (rombak): **paddleocr-vl 1.6**, **qwen3-vl-30b**, dan
+**glm-4.6v-flash** semuanya dipanggil lewat API OpenAI-compatible yang SAMA
+(`config.VLM_API_BASE_URL`, default `http://10.0.1.250:1234/v1`) — beda nama
+model. **Tidak ada lagi PaddleOCR yang dimuat lokal.** NuExtract3-GGUF
+(lokal) SEMENTARA OFF (`config.NUEXTRACT_ENABLED=False`).
 
 ## Struktur & Aturan Wajib
 
@@ -11,72 +12,69 @@ API** (support, tulisan tangan/coretan — dipanggil selektif).
    - `./run.sh` -> batch SEMUA dokumen contoh.
    - `./run.sh --ui` -> UI Gradio di browser.
    - UI dibangun di `run_batch.build_ui()`. Belum ada `app.py` terpisah.
-2. **Registry adalah satu-satunya daftar model** (`models/registry.py`).
-   Jangan import class model spesifik dari `run_batch.py`/UI — tidak ada
-   percabangan if/elif berdasarkan nama model.
+2. **Registry adalah satu-satunya daftar model** (`models/registry.py`):
+   `PaddleOCR-VL 1.6 (API)`, `Qwen3-VL-30B (API)`, `GLM-4.6V-Flash (API)`,
+   `NuExtract3-GGUF` (off). Jangan import class model spesifik dari
+   `run_batch.py`/UI — tidak ada percabangan if/elif berdasarkan nama model.
 3. **Setiap dokumen WAJIB lewat `preprocessing/pipeline.preprocess()`**
    sebelum dikirim ke model mana pun. Quality gate dihitung & dicatat;
    `STRICT_QUALITY_GATE=False` (default) => dokumen tetap diproses (anti miss).
-4. **Model utama**: `models/nuextract_gguf_model.py` (NuExtract3-GGUF,
-   llama.cpp, Q4_K_M + mmproj). **Support**: `models/paddleocr_model.py`
-   (PaddleOCR detect-then-recognize + CLAHE + spatial sort, dengan
-   `run_region()`/`run_header()` untuk OCR per-wilayah).
-   **Layout**: `models/layout_model.py` (PP-DocLayoutV3, deteksi zona
-   `header_image`/`header`/`table`; model lokal offline).
-   **VLM API**: `models/vlm_api_model.py` (GLM-4.6V-Flash via API lokal
-   OpenAI-compatible `http://10.0.1.250:1234/v1`; model TIDAK dimuat lokal).
-   Tugasnya: baca tulisan tangan, pahami coretan (ciretan) + pembetulan di
-   sebelahnya. Dipanggil SELEKTIF oleh `run_batch.process_one`:
-   heuristik (`selection/selector.detect_handwriting_heuristic`) -> detect
-   YA/TIDAK -> read (corrections + cleaned_text digabung ke OCR text) ->
-   review field JSON (nilai pembetulan menang, nilai asli dicatat di
-   `result["vlm"]["review_changes"]`).
+4. **Model API (semua via `models/vlm_api_model.OpenAIVLModel`)**:
+   - `models/paddleocr_model.py` (`PaddleOCRVLApiModel`): OCR pengganti
+     PaddleOCR lokal. Interface `run()`/`run_region()`/`run_header()` tetap
+     (dipakai `run_batch._zone_ocr`). Output model di-parse jadi baris
+     `text`+`bbox`+`confidence` (default netral bila tidak ada confidence).
+   - `models/vlm_api_model.py`: `OpenAIVLModel` (base) + `VLMApiModel` (GLM)
+     + `Qwen3VLModel` (qwen3-vl-30b). Punya `extract_document()` (JSON sesuai
+     `extraction/schemas.py`) dan langkah tulisan tangan/coretan
+     (detect/read/review).
+   - **Layout**: `models/layout_model.py` (PP-DocLayoutV3) MASIH lokal/offline.
+     Dipakai untuk OCR zona tabel (`config.LAYOUT_ZONE_TARGETS`). Model layout
+     dimuat per dokumen lalu di-UNLOAD (jaga RAM) — jangan jadikan singleton
+     persistent.
+   - **NuExtract3-GGUF**: `models/nuextract_gguf_model.py` — JANGAN diubah,
+     tetap terdaftar tapi hanya dijalankan bila `config.NUEXTRACT_ENABLED=True`.
 5. **PENTING (jangan diubah tanpa alasan teknis)**:
-   - Gambar WAJIB melewati `fit_image_for_vision` (<= 900k px) sebelum dikirim
-     ke NuExtract — CLIP/mmproj llama.cpp segfault di atas ~1 MP.
-   - Teks OCR adalah KONTEKS, bukan sumber kebenaran. TIDAK ada aturan yang
-     membatasi: selama OCR menghasilkan teks, teks SELALU dikirim ke NuExtract
-     (lihat `selection/selector.py`). Confidence tetap disimpan di hasil.
-   - **Deskew DINONAKTIFKAN** (`USE_DESKEW=False` di `preprocessing/pipeline.py`).
-     minAreaRect bisa memberi sudut ~±90° pada halaman yang lurus dan meng-rotasi
-     -90°, menghilangkan baris teks kecil (header) dari deteksi PaddleOCR.
-     Jangan aktifkan tanpa uji.
-   - PaddleX dipatch offline (`_patch_paddlex_offline`) supaya memakai model
-     lokal `~/.paddlex/official_models` — jangan hapus, hindari download.
-   - Chat template NuExtract: `extraction/nuextract3_chat_template.jinja`.
-     Jangan ganti dengan template lain (GGUF tidak meng-embed-nya).
-   - Schema/instruksi per jenis: `extraction/schemas.py` (dari notebook yang
-     sudah terbukti akurat).
-   - **OCR per-layout** (lihat `config.LAYOUT_*`): band header/logo memakai
-     `run_header` (wide-band 22% atas) — SENG AJA tidak memakai bbox zona
-     `header_image`/`header` karena teks nama di logo melewati batas zona.
-     Zona `table` dicrop + upscale via `run_region()`.
-   - **Model layout dimuat per dokumen lalu di-UNLOAD** (di `run_batch._zone_ocr`):
-     menjaga peak RAM tetap di bawah batas saat NuExtract dimuat. Jangan
-     mengubahnya menjadi persistent singleton.
-6. **Tidak ada file lain yang boleh diubah saat menambah model** selain
-   `models/` + `models/registry.py`. PENGECUALIAN yang SAH (integrasi VLM
-   tulisan tangan/coretan): `config.py` (blok `VLM_API_*`),
-   `run_batch.py` (`process_one` + singleton `get_vlm_model` + `result["vlm"]`),
-   `extraction/schemas.py` (instruksi nilai pembetulan), dan
-   `selection/selector.py` (`detect_handwriting_heuristic`). Jangan menambah
-   file lain tanpa alasan teknis.
+   - Gambar untuk NuExtract WAJIB melewati `fit_image_for_vision`
+     (CLIP/mmproj segfault > ~1 MP). Untuk model API cukup
+     `_encode_image()` (JPEG, batas `VLM_API_MAX_SIDE`).
+   - Teks OCR adalah KONTEKS, bukan sumber kebenaran. TIDAK ada aturan
+     pemblokiran: selama OCR menghasilkan teks, teks SELALU dikirim sebagai
+     konteks (lihat `selection/selector.py`). Confidence tetap disimpan.
+   - **Deskew DINONAKTIFKAN** (`USE_DESKEW=False` di
+     `preprocessing/pipeline.py`).
+   - **Fusion**: `fusion.py` — rule-based, field-aware (numeric/id_code/
+     free_text). paddleocr-vl TIDAK masuk fusion per-field; ia lewat
+     `validation.correct_codes_from_ocr` untuk field kode/nomor.
+   - **Tulisan tangan/coretan**: heuristik `selection/selector.py`
+     (`detect_handwriting_heuristic`) -> GLM `detect_handwriting` YA/TIDAK ->
+     `read_handwriting` (koreksi + cleaned_text) -> `review_fields` (nilai
+     pembetulan menang, nilai asli dicatat di `result["vlm"]["review_changes"]`).
+   - **3 skrip test latency** (tidak memuat model, murni benchmark API):
+     `test_paddleocr_vl_api.py`, `test_qwen3_vl_api.py`, `test_glm_api.py`.
+6. **Hasil per dokumen**: `result["extraction_sources"]` (tiap sumber qwen3/
+   glm beserta fields+confidence+elapsed), `result["fusion"]` (per-field
+   `{value, confidence, source_used, had_conflict}`), `result["ocr"]`,
+   `result["vlm"]`.
 
 ## Perintah Verifikasi
 
 - Batch semua dokumen: `./run.sh` atau `venv/bin/python run_batch.py`
 - Batch dokumen tertentu: `./run.sh "contoh invoice/Intisolusindo/Invoice_intisolusindo.pdf"`
 - UI Gradio: `./run.sh --ui` (host 127.0.0.1:7860; `--ui --share` untuk link publik)
+- Test latency API:
+  - `python test_paddleocr_vl_api.py`
+  - `python test_qwen3_vl_api.py`
+  - `python test_glm_api.py`
 - Model dimuat SEKALI via singleton di `run_batch.py` (`get_ocr_model()` /
-  `get_extractor()`). Jangan buat load/unload berulang dalam satu proses.
-  PENGECUALIAN: `get_layout_model()` dimuat per dokumen lalu di-unload
-  (hemat RAM — lihat aturan 5).
+  `get_qwen3_model()` / `get_glm_model()`). PENGECUALIAN: `get_layout_model()`
+  dimuat per dokumen lalu di-unload (hemat RAM — lihat aturan 4).
 
 ## Catatan Lingkungan
 
-- Model NuExtract3-GGUF: `data/models/nuextract3/` (Q4_K_M 2.6G + mmproj 645M).
-- Model PaddleOCR + PP-DocLayoutV3: `~/.paddlex/official_models` (jangan download ulang).
-- RAM saat proses ±5–6GB (PaddleOCR + NuExtract3 + PP-DocLayoutV3 dalam satu proses).
-  Layout di-unload per dokumen agar peak tidak melewati batas; bila RAM tersedia
-  < 6GB jalankan batch per-grup.
+- Model NuExtract3-GGUF: `data/models/nuextract3/` (tidak dimuat selama off).
+- Model PP-DocLayoutV3: `~/.paddlex/official_models` (lokal, jangan download ulang).
+- Model VLM (paddleocr-vl 1.6 / qwen3-vl-30b / glm-4.6v-flash) tidak dimuat
+  lokal — cukup HTTP ke `config.VLM_API_BASE_URL`. Bila nama model di gateway
+  berbeda, override via env: `PADDLEOCR_VL_MODEL`, `QWEN3_VL_MODEL`, `GLM_VL_MODEL`.
 - `results/` tidak di-commit (lihat `.gitignore`).
